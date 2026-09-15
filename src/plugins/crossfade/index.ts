@@ -171,8 +171,17 @@ export default createPlugin<
     });
 
     ipc.handle('audio-url', async (videoID: string) => {
-      const info = await yt.getBasicInfo(videoID);
-      return info.streaming_data?.formats[0].decipher(yt.session.player);
+      const format = await yt.getStreamingData(videoID, {
+        type: 'audio',
+        quality: 'best',
+        format: 'any',
+      });
+
+      if (!format.url) {
+        throw new Error(`No audio stream URL returned for ${videoID}`);
+      }
+
+      return format.url;
     });
   },
 
@@ -202,9 +211,15 @@ export default createPlugin<
 
       const getStreamURL = async (videoID: string): Promise<string | undefined> => {
         try {
-          return (await this.ipc?.invoke('audio-url', videoID)) as
+          const url = (await this.ipc?.invoke('audio-url', videoID)) as
             | string
             | undefined;
+
+          if (!url) {
+            console.error('[crossfade] No stream URL returned', videoID);
+          }
+
+          return url;
         } catch (error) {
           console.error('[crossfade] Failed to get stream URL', error);
           return undefined;
@@ -251,6 +266,9 @@ export default createPlugin<
           },
           onloaderror: (_id, error) => {
             console.error('[crossfade] Failed to load transition audio', error);
+          },
+          onplayerror: (_id, error) => {
+            console.error('[crossfade] Failed to play transition audio', error);
           },
         });
       };
