@@ -261,20 +261,72 @@ export default createPlugin<
       let incomingVolume = video.volume;
       let mirrorGeneration = 0;
 
+      const inferFormatFromUrl = (
+        url: string,
+      ): CrossfadeAudioStream['format'] | undefined => {
+        try {
+          const parsed = new URL(url);
+          const mime = parsed.searchParams.get('mime')?.toLowerCase();
+
+          if (mime?.includes('audio/webm')) return 'webm';
+          if (mime?.includes('audio/mp4')) return 'mp4';
+          if (mime?.includes('audio/ogg')) return 'ogg';
+          if (mime?.includes('audio/mpeg')) return 'mp3';
+
+          const itag = parsed.searchParams.get('itag');
+
+          if (itag && ['249', '250', '251'].includes(itag)) return 'webm';
+          if (itag && ['139', '140', '141'].includes(itag)) return 'mp4';
+        } catch {
+          return undefined;
+        }
+
+        return undefined;
+      };
+
       const getStream = async (
         videoID: string,
       ): Promise<CrossfadeAudioStream | undefined> => {
         try {
-          const stream = (await this.ipc?.invoke(
-            'audio-url',
-            videoID,
-          )) as CrossfadeAudioStream | undefined;
+          const response = await this.ipc?.invoke('audio-url', videoID);
 
-          if (!stream?.url) {
-            console.error('[crossfade] No stream URL returned', videoID);
+          if (typeof response === 'string') {
+            const format = inferFormatFromUrl(response);
+
+            if (!format) {
+              console.error(
+                '[crossfade] Stream URL returned without recognizable format',
+                videoID,
+              );
+              return undefined;
+            }
+
+            console.warn(
+              '[crossfade] Received legacy string stream response; inferred format',
+              format,
+            );
+
+            return {
+              url: response,
+              format,
+            };
           }
 
-          return stream;
+          if (
+            response &&
+            typeof response === 'object' &&
+            typeof response.url === 'string' &&
+            typeof response.format === 'string'
+          ) {
+            return response as CrossfadeAudioStream;
+          }
+
+          console.error(
+            '[crossfade] Invalid audio stream response',
+            videoID,
+            response,
+          );
+          return undefined;
         } catch (error) {
           console.error('[crossfade] Failed to get stream URL', error);
           return undefined;
