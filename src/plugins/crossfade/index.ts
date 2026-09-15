@@ -184,6 +184,9 @@ export default createPlugin<
     onPlayerApiReady() {
       const api = document.querySelector<Element & MusicPlayer>('#movie_player');
       const video = api?.querySelector<HTMLVideoElement>('video');
+      const progressBar = document.querySelector<
+        HTMLElement & { value: string; max?: string }
+      >('#progress-bar');
 
       if (!api || !video) {
         console.error('[crossfade] Player API or video element is unavailable');
@@ -191,6 +194,7 @@ export default createPlugin<
       }
 
       let transitionAudio: Howl | undefined;
+      let transitionAudioVideoID: string | undefined;
       let currentVideoID = api.getVideoData().video_id;
       let transitionTriggeredForVideoID: string | undefined;
       let awaitingIncomingFade = false;
@@ -250,15 +254,25 @@ export default createPlugin<
         }
       };
 
-      const isReadyToCrossfade = () =>
+      const getProgressValue = () =>
+        Number(progressBar?.value ?? progressBar?.getAttribute('value'));
+
+      const getActiveVideoID = () => api.getVideoData().video_id;
+
+      const isReadyToCrossfade = (videoID = currentVideoID) =>
+        transitionAudioVideoID === videoID &&
         transitionAudio?.state() === 'loaded' &&
         transitionAudio._sounds[0]?._node instanceof HTMLMediaElement;
 
       const syncMirrorToVideo = (audio: Howl) => {
         audio.play();
-        audio.seek(api.getCurrentTime());
 
-        if (api.getPlayerState() !== 1) {
+        const progressValue = getProgressValue();
+        audio.seek(
+          Number.isFinite(progressValue) ? progressValue : api.getCurrentTime(),
+        );
+
+        if (video.paused) {
           audio.pause();
         }
       };
@@ -270,7 +284,7 @@ export default createPlugin<
         if (
           !bufferedAudio ||
           generation !== mirrorGeneration ||
-          videoID !== currentVideoID
+          videoID !== getActiveVideoID()
         ) {
           return;
         }
@@ -283,7 +297,7 @@ export default createPlugin<
           onload: () => {
             if (
               generation !== mirrorGeneration ||
-              videoID !== currentVideoID
+              videoID !== getActiveVideoID()
             ) {
               audio.unload();
               return;
@@ -291,6 +305,7 @@ export default createPlugin<
 
             transitionAudio?.unload();
             transitionAudio = audio;
+            transitionAudioVideoID = videoID;
             console.info('[crossfade] Buffered transition audio ready', videoID);
             syncMirrorToVideo(audio);
           },
@@ -341,6 +356,7 @@ export default createPlugin<
         incomingVolume = video.volume;
         awaitingIncomingFade = true;
         transitionAudio = undefined;
+        transitionAudioVideoID = undefined;
         video.volume = 0;
 
         const duration = this.config?.fadeOutDuration ?? 0;
@@ -361,9 +377,42 @@ export default createPlugin<
         return true;
       };
 
+      const handleActiveVideoChange = () => {
+        const activeVideoID = getActiveVideoID();
+
+        if (!activeVideoID || activeVideoID === currentVideoID) {
+          return;
+        }
+
+        const previousVideoID = currentVideoID;
+
+        if (!awaitingIncomingFade && isReadyToCrossfade(previousVideoID)) {
+          beginOutgoingFade();
+        }
+
+        currentVideoID = activeVideoID;
+        transitionTriggeredForVideoID = undefined;
+
+        if (awaitingIncomingFade) {
+          const targetVolume = incomingVolume;
+          awaitingIncomingFade = false;
+          fadeVideoIn(targetVolume);
+        }
+
+        console.info('[crossfade] Active track changed', {
+          from: previousVideoID,
+          to: activeVideoID,
+        });
+
+        void prepareMirror(activeVideoID);
+      };
+
       video.addEventListener('seeking', () => {
-        if (transitionAudio?.state() === 'loaded') {
-          transitionAudio.seek(api.getCurrentTime());
+        if (isReadyToCrossfade() && transitionAudio) {
+          const progressValue = getProgressValue();
+          transitionAudio.seek(
+            Number.isFinite(progressValue) ? progressValue : api.getCurrentTime(),
+          );
         }
       });
 
@@ -372,19 +421,15 @@ export default createPlugin<
       });
 
       video.addEventListener('play', () => {
-        if (transitionAudio?.state() === 'loaded') {
+        if (isReadyToCrossfade() && transitionAudio) {
           syncMirrorToVideo(transitionAudio);
         }
       });
 
-      const progressBar = document.querySelector<
-        HTMLElement & { value: string; max?: string }
-      >('#progress-bar');
-
       const checkForCrossfade = (elapsed?: number) => {
-        const progressValue =
-          elapsed ??
-          Number(progressBar?.value ?? progressBar?.getAttribute('value'));
+        handleActiveVideoChange();
+
+        const progressValue = elapsed ?? getProgressValue();
         const progressMax = Number(
           progressBar?.max ?? progressBar?.getAttribute('max'),
         );
@@ -409,6 +454,7 @@ export default createPlugin<
           currentTime: progressValue,
           duration,
           secondsBeforeEnd,
+          mirrorVideoID: transitionAudioVideoID,
           mirrorReady: isReadyToCrossfade(),
         });
 
@@ -443,32 +489,15 @@ export default createPlugin<
         console.error('[crossfade] Progress bar is unavailable');
       }
 
-      api.addEventListener('videodatachange', (name, videoData) => {
-        if (name !== 'dataloaded' || !videoData.videoId) {
+      api.addEventListener('videodatachange', (name) => {
+        if (name !== 'dataloaded') {
           return;
         }
 
-        const nextVideoID = videoData.videoId;
-        if (nextVideoID === currentVideoID) {
-          return;
-        }
-
-        // A manual skip does not pass through the near-end trigger, so start the
-        // outgoing fade here while the old mirrored track is still available.
-        if (!awaitingIncomingFade) {
-          beginOutgoingFade();
-        }
-
-        currentVideoID = nextVideoID;
-        transitionTriggeredForVideoID = undefined;
-
-        if (awaitingIncomingFade) {
-          const targetVolume = incomingVolume;
-          awaitingIncomingFade = false;
-          fadeVideoIn(targetVolume);
-        }
-
-        void prepareMirror(nextVideoID);
+        // YouTube Music can emit dataloaded for a queued/preloaded track before
+        // it becomes the active player item. Always resolve identity from the
+        // player API rather than trusting the event payload.
+        handleActiveVideoChange();
       });
 
       if (currentVideoID) {
