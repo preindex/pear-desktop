@@ -282,6 +282,10 @@ export default createPlugin<
           return false;
         }
 
+        if (!outgoingAudio.playing()) {
+          outgoingAudio.play();
+        }
+
         incomingVolume = video.volume;
         awaitingIncomingFade = true;
         transitionAudio = undefined;
