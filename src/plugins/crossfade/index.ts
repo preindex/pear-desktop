@@ -174,7 +174,7 @@ export default createPlugin<
 
   async backend({ ipc }) {
     const netFetch = getNetFetchAsFetch();
-    const yt = await Innertube.create({
+    const ytPromise = Innertube.create({
       fetch: netFetch,
     });
 
@@ -221,6 +221,7 @@ export default createPlugin<
 
     ipc.handle('crossfade-audio-data-v1', async (videoID: string) => {
       const failures: string[] = [];
+      const yt = await ytPromise;
 
       for (const client of streamingClients) {
         try {
