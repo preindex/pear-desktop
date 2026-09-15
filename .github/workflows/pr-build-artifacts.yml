@@ -115,11 +115,30 @@ jobs:
 
             let comment;
             if (buildResult === 'success') {
-              comment = `## 🚀 Build Artifacts Ready!\n\n            The builds have completed successfully. You can download the artifacts from the workflow run:\n\n            **[📦 Download Artifacts](${runUrl})**\n\n            ### Available builds:\n            - **Windows**: \`build-artifacts-windows-latest\`\n            - **macOS**: \`build-artifacts-macos-latest\`\n            - **Linux**: \`build-artifacts-ubuntu-latest\`\n\n            *Note: Artifacts are available for 7 days.*`;
+              comment = `## 🚀 Build Artifacts Ready!
+
+            The builds have completed successfully. You can download the artifacts from the workflow run:
+
+            **[📦 Download Artifacts](${runUrl})**
+
+            ### Available builds:
+            - **Windows**: \`build-artifacts-windows-latest\`
+            - **macOS**: \`build-artifacts-macos-latest\`
+            - **Linux**: \`build-artifacts-ubuntu-latest\`
+
+            *Note: Artifacts are available for 7 days.*`;
             } else if (buildResult === 'failure') {
-              comment = `## ❌ Build Failed\n\n            Unfortunately, one or more builds failed. Please check the workflow run for details:\n\n            **[View Workflow Run](${runUrl})**`;
+              comment = `## ❌ Build Failed
+
+            Unfortunately, one or more builds failed. Please check the workflow run for details:
+
+            **[View Workflow Run](${runUrl})**`;
             } else {
-              comment = `## ⚠️ Build Status: ${buildResult}\n\n            The build process completed with status: **${buildResult}**\n\n            **[View Workflow Run](${runUrl})**`;
+              comment = `## ⚠️ Build Status: ${buildResult}
+
+            The build process completed with status: **${buildResult}**
+
+            **[View Workflow Run](${runUrl})**`;
             }
 
             github.rest.issues.createComment({
