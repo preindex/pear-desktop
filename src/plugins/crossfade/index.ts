@@ -21,6 +21,12 @@ export type CrossfadePluginConfig = {
   fadeScaling: 'linear' | 'logarithmic' | number;
 };
 
+type CrossfadeAudioStream = {
+  url: string;
+  format: 'webm' | 'mp4' | 'ogg' | 'mp3';
+  mimeType?: string;
+};
+
 export default createPlugin<
   unknown,
   unknown,
@@ -176,26 +182,48 @@ export default createPlugin<
       'WEB_EMBEDDED',
     ] as const;
 
+    const getHowlerFormat = (
+      mimeType?: string,
+    ): CrossfadeAudioStream['format'] | undefined => {
+      const mime = mimeType?.toLowerCase();
+
+      if (mime?.includes('audio/webm')) return 'webm';
+      if (mime?.includes('audio/mp4')) return 'mp4';
+      if (mime?.includes('audio/ogg')) return 'ogg';
+      if (mime?.includes('audio/mpeg')) return 'mp3';
+
+      return undefined;
+    };
+
     ipc.handle('audio-url', async (videoID: string) => {
       const failures: string[] = [];
 
       for (const client of streamingClients) {
         try {
-          const format = await yt.getStreamingData(videoID, {
+          const stream = await yt.getStreamingData(videoID, {
             client,
             type: 'audio',
             quality: 'best',
             format: 'any',
           });
 
-          if (format.url) {
+          const howlerFormat = getHowlerFormat(stream.mime_type);
+
+          if (stream.url && howlerFormat) {
             console.info(
-              `[crossfade] Using ${client} audio stream for ${videoID}`,
+              `[crossfade] Using ${client} ${stream.mime_type ?? howlerFormat} audio stream for ${videoID}`,
             );
-            return format.url;
+
+            return {
+              url: stream.url,
+              format: howlerFormat,
+              mimeType: stream.mime_type,
+            } satisfies CrossfadeAudioStream;
           }
 
-          failures.push(`${client}: no URL`);
+          failures.push(
+            `${client}: ${stream.url ? `unsupported MIME ${stream.mime_type ?? 'unknown'}` : 'no URL'}`,
+          );
         } catch (error) {
           failures.push(
             `${client}: ${error instanceof Error ? error.message : String(error)}`,
@@ -233,17 +261,20 @@ export default createPlugin<
       let incomingVolume = video.volume;
       let mirrorGeneration = 0;
 
-      const getStreamURL = async (videoID: string): Promise<string | undefined> => {
+      const getStream = async (
+        videoID: string,
+      ): Promise<CrossfadeAudioStream | undefined> => {
         try {
-          const url = (await this.ipc?.invoke('audio-url', videoID)) as
-            | string
-            | undefined;
+          const stream = (await this.ipc?.invoke(
+            'audio-url',
+            videoID,
+          )) as CrossfadeAudioStream | undefined;
 
-          if (!url) {
+          if (!stream?.url) {
             console.error('[crossfade] No stream URL returned', videoID);
           }
 
-          return url;
+          return stream;
         } catch (error) {
           console.error('[crossfade] Failed to get stream URL', error);
           return undefined;
@@ -265,14 +296,19 @@ export default createPlugin<
 
       const prepareMirror = async (videoID: string) => {
         const generation = ++mirrorGeneration;
-        const url = await getStreamURL(videoID);
+        const stream = await getStream(videoID);
 
-        if (!url || generation !== mirrorGeneration || videoID !== currentVideoID) {
+        if (
+          !stream ||
+          generation !== mirrorGeneration ||
+          videoID !== currentVideoID
+        ) {
           return;
         }
 
         const audio = new Howl({
-          src: url,
+          src: [stream.url],
+          format: [stream.format],
           html5: true,
           volume: 0,
           onload: () => {
@@ -289,7 +325,11 @@ export default createPlugin<
             syncMirrorToVideo(audio);
           },
           onloaderror: (_id, error) => {
-            console.error('[crossfade] Failed to load transition audio', error);
+            console.error(
+              '[crossfade] Failed to load transition audio',
+              stream.mimeType ?? stream.format,
+              error,
+            );
           },
           onplayerror: (_id, error) => {
             console.error('[crossfade] Failed to play transition audio', error);
