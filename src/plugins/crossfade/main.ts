@@ -17,6 +17,7 @@ export const backend = async ({
   });
 
   const streamingClients = [
+    'VISIONOS',
     'ANDROID_VR',
     'TV',
     'WEB_EMBEDDED',
