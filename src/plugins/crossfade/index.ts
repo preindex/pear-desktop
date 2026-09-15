@@ -21,10 +21,11 @@ export type CrossfadePluginConfig = {
   fadeScaling: 'linear' | 'logarithmic' | number;
 };
 
-type CrossfadeAudioStream = {
-  url: string;
-  format: 'webm' | 'mp4' | 'ogg' | 'mp3';
-  mimeType?: string;
+type CrossfadeAudioFormat = 'webm' | 'mp4' | 'ogg' | 'mp3';
+
+type CrossfadeBufferedAudio = {
+  dataUrl: string;
+  format: CrossfadeAudioFormat;
 };
 
 export default createPlugin<
@@ -172,8 +173,9 @@ export default createPlugin<
   },
 
   async backend({ ipc }) {
+    const netFetch = getNetFetchAsFetch();
     const yt = await Innertube.create({
-      fetch: getNetFetchAsFetch(),
+      fetch: netFetch,
     });
 
     const streamingClients = [
@@ -184,7 +186,7 @@ export default createPlugin<
 
     const getHowlerFormat = (
       mimeType?: string,
-    ): CrossfadeAudioStream['format'] | undefined => {
+    ): CrossfadeAudioFormat | undefined => {
       const mime = mimeType?.toLowerCase();
 
       if (mime?.includes('audio/webm')) return 'webm';
@@ -195,7 +197,29 @@ export default createPlugin<
       return undefined;
     };
 
-    ipc.handle('audio-url', async (videoID: string) => {
+    const getBaseMimeType = (
+      mimeType: string | null | undefined,
+      format: CrossfadeAudioFormat,
+    ) => {
+      const mime = mimeType?.split(';')[0]?.trim().toLowerCase();
+
+      if (mime?.startsWith('audio/')) {
+        return mime;
+      }
+
+      switch (format) {
+        case 'webm':
+          return 'audio/webm';
+        case 'mp4':
+          return 'audio/mp4';
+        case 'ogg':
+          return 'audio/ogg';
+        case 'mp3':
+          return 'audio/mpeg';
+      }
+    };
+
+    ipc.handle('crossfade-audio-data-v1', async (videoID: string) => {
       const failures: string[] = [];
 
       for (const client of streamingClients) {
@@ -209,21 +233,37 @@ export default createPlugin<
 
           const howlerFormat = getHowlerFormat(stream.mime_type);
 
-          if (stream.url && howlerFormat) {
-            console.info(
-              `[crossfade] Using ${client} ${stream.mime_type ?? howlerFormat} audio stream for ${videoID}`,
+          if (!stream.url || !howlerFormat) {
+            failures.push(
+              `${client}: ${stream.url ? `unsupported MIME ${stream.mime_type ?? 'unknown'}` : 'no URL'}`,
             );
-
-            return {
-              url: stream.url,
-              format: howlerFormat,
-              mimeType: stream.mime_type,
-            } satisfies CrossfadeAudioStream;
+            continue;
           }
 
-          failures.push(
-            `${client}: ${stream.url ? `unsupported MIME ${stream.mime_type ?? 'unknown'}` : 'no URL'}`,
+          const response = await netFetch(stream.url);
+          if (!response.ok) {
+            failures.push(`${client}: media fetch HTTP ${response.status}`);
+            continue;
+          }
+
+          const audioBuffer = await response.arrayBuffer();
+          if (audioBuffer.byteLength === 0) {
+            failures.push(`${client}: empty media response`);
+            continue;
+          }
+
+          const mimeType = getBaseMimeType(
+            stream.mime_type ?? response.headers.get('content-type'),
+            howlerFormat,
           );
+          const { Buffer } = await import('node:buffer');
+          const dataUrl = `data:${mimeType};base64,${Buffer.from(audioBuffer).toString('base64')}`;
+
+          console.info(
+            `[crossfade] Buffered ${client} ${mimeType} audio for ${videoID} (${audioBuffer.byteLength} bytes)`,
+          );
+
+          return dataUrl;
         } catch (error) {
           failures.push(
             `${client}: ${error instanceof Error ? error.message : String(error)}`,
@@ -232,7 +272,7 @@ export default createPlugin<
       }
 
       throw new Error(
-        `No usable audio stream for ${videoID} (${failures.join('; ')})`,
+        `No usable buffered audio for ${videoID} (${failures.join('; ')})`,
       );
     });
   },
@@ -261,74 +301,52 @@ export default createPlugin<
       let incomingVolume = video.volume;
       let mirrorGeneration = 0;
 
-      const inferFormatFromUrl = (
-        url: string,
-      ): CrossfadeAudioStream['format'] | undefined => {
-        try {
-          const parsed = new URL(url);
-          const mime = parsed.searchParams.get('mime')?.toLowerCase();
+      const inferFormatFromDataUrl = (
+        dataUrl: string,
+      ): CrossfadeAudioFormat | undefined => {
+        const mime = /^data:(audio\/[^;,]+)/i.exec(dataUrl)?.[1]?.toLowerCase();
 
-          if (mime?.includes('audio/webm')) return 'webm';
-          if (mime?.includes('audio/mp4')) return 'mp4';
-          if (mime?.includes('audio/ogg')) return 'ogg';
-          if (mime?.includes('audio/mpeg')) return 'mp3';
-
-          const itag = parsed.searchParams.get('itag');
-
-          if (itag && ['249', '250', '251'].includes(itag)) return 'webm';
-          if (itag && ['139', '140', '141'].includes(itag)) return 'mp4';
-        } catch {
-          return undefined;
-        }
+        if (mime?.includes('audio/webm')) return 'webm';
+        if (mime?.includes('audio/mp4')) return 'mp4';
+        if (mime?.includes('audio/ogg')) return 'ogg';
+        if (mime?.includes('audio/mpeg')) return 'mp3';
 
         return undefined;
       };
 
-      const getStream = async (
+      const getBufferedAudio = async (
         videoID: string,
-      ): Promise<CrossfadeAudioStream | undefined> => {
+      ): Promise<CrossfadeBufferedAudio | undefined> => {
         try {
-          const response = await this.ipc?.invoke('audio-url', videoID);
-
-          if (typeof response === 'string') {
-            const format = inferFormatFromUrl(response);
-
-            if (!format) {
-              console.error(
-                '[crossfade] Stream URL returned without recognizable format',
-                videoID,
-              );
-              return undefined;
-            }
-
-            console.warn(
-              '[crossfade] Received legacy string stream response; inferred format',
-              format,
-            );
-
-            return {
-              url: response,
-              format,
-            };
-          }
-
-          if (
-            response &&
-            typeof response === 'object' &&
-            typeof response.url === 'string' &&
-            typeof response.format === 'string'
-          ) {
-            return response as CrossfadeAudioStream;
-          }
-
-          console.error(
-            '[crossfade] Invalid audio stream response',
+          const response = await this.ipc?.invoke(
+            'crossfade-audio-data-v1',
             videoID,
-            response,
           );
-          return undefined;
+
+          if (typeof response !== 'string' || !response.startsWith('data:audio/')) {
+            console.error(
+              '[crossfade] Invalid buffered audio response',
+              videoID,
+              typeof response,
+            );
+            return undefined;
+          }
+
+          const format = inferFormatFromDataUrl(response);
+          if (!format) {
+            console.error(
+              '[crossfade] Buffered audio has unsupported MIME type',
+              videoID,
+            );
+            return undefined;
+          }
+
+          return {
+            dataUrl: response,
+            format,
+          };
         } catch (error) {
-          console.error('[crossfade] Failed to get stream URL', error);
+          console.error('[crossfade] Failed to get buffered audio', error);
           return undefined;
         }
       };
@@ -348,10 +366,10 @@ export default createPlugin<
 
       const prepareMirror = async (videoID: string) => {
         const generation = ++mirrorGeneration;
-        const stream = await getStream(videoID);
+        const bufferedAudio = await getBufferedAudio(videoID);
 
         if (
-          !stream ||
+          !bufferedAudio ||
           generation !== mirrorGeneration ||
           videoID !== currentVideoID
         ) {
@@ -359,8 +377,8 @@ export default createPlugin<
         }
 
         const audio = new Howl({
-          src: [stream.url],
-          format: [stream.format],
+          src: [bufferedAudio.dataUrl],
+          format: [bufferedAudio.format],
           html5: true,
           volume: 0,
           onload: () => {
@@ -374,12 +392,13 @@ export default createPlugin<
 
             transitionAudio?.unload();
             transitionAudio = audio;
+            console.info('[crossfade] Buffered transition audio ready', videoID);
             syncMirrorToVideo(audio);
           },
           onloaderror: (_id, error) => {
             console.error(
-              '[crossfade] Failed to load transition audio',
-              stream.mimeType ?? stream.format,
+              '[crossfade] Failed to load buffered transition audio',
+              bufferedAudio.format,
               error,
             );
           },
