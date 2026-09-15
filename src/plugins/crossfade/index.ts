@@ -1,6 +1,6 @@
 import prompt from 'custom-electron-prompt';
 import { Howl } from 'howler';
-import { Innertube } from '\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js';
+import { Innertube } from 'youtubei.js';
 
 import { t } from '@/i18n';
 import { getNetFetchAsFetch } from '@/plugins/utils/main';
@@ -10,6 +10,7 @@ import { createPlugin } from '@/utils';
 import { VolumeFader } from './fader';
 
 import type { RendererContext } from '@/types/contexts';
+import type { MusicPlayer } from '@/types/music-player';
 import type { BrowserWindow } from 'electron';
 
 export type CrossfadePluginConfig = {
@@ -184,138 +185,192 @@ export default createPlugin<
       this.config = newConfig;
     },
     onPlayerApiReady() {
-      let transitionAudio: Howl; // Howler audio used to fade out the current music
-      let firstVideo = true;
-      let waitForTransition: Promise<unknown>;
+      const api = document.querySelector<Element & MusicPlayer>('#movie_player');
+      const video = document.querySelector<HTMLVideoElement>('video');
 
-      const getStreamURL = async (videoID: string): Promise<string> =>
-        this.ipc?.invoke('audio-url', videoID) as Promise<string>;
+      if (!api || !video) {
+        console.error('[crossfade] Player API or video element is unavailable');
+        return;
+      }
 
-      const getVideoIDFromURL = (url: string) =>
-        new URLSearchParams(url.split('?')?.at(-1)).get('v');
+      let transitionAudio: Howl | undefined;
+      let currentVideoID = api.getVideoData().video_id;
+      let transitionTriggeredForVideoID: string | undefined;
+      let awaitingIncomingFade = false;
+      let incomingVolume = video.volume;
+      let mirrorGeneration = 0;
 
-      const isReadyToCrossfade = () =>
-        transitionAudio && transitionAudio.state() === 'loaded';
-
-      const watchVideoIDChanges = (cb: (id: string) => void) => {
-        window.navigation.addEventListener('navigate', (event) => {
-          const currentVideoID = getVideoIDFromURL(
-            (event.currentTarget as Navigation).currentEntry?.url ?? '',
-          );
-          const nextVideoID = getVideoIDFromURL(event.destination.url ?? '');
-
-          if (
-            nextVideoID &&
-            currentVideoID &&
-            (firstVideo || nextVideoID !== currentVideoID)
-          ) {
-            if (isReadyToCrossfade()) {
-              crossfade(() => {
-                cb(nextVideoID);
-              });
-            } else {
-              cb(nextVideoID);
-              firstVideo = false;
-            }
-          }
-        });
+      const getStreamURL = async (videoID: string): Promise<string | undefined> => {
+        try {
+          return (await this.ipc?.invoke('audio-url', videoID)) as
+            | string
+            | undefined;
+        } catch (error) {
+          console.error('[crossfade] Failed to get stream URL', error);
+          return undefined;
+        }
       };
 
-      const createAudioForCrossfade = (url: string) => {
-        if (transitionAudio) {
-          transitionAudio.unload();
+      const isReadyToCrossfade = () =>
+        transitionAudio?.state() === 'loaded' &&
+        transitionAudio._sounds[0]?._node instanceof HTMLMediaElement;
+
+      const syncMirrorToVideo = (audio: Howl) => {
+        audio.play();
+        audio.seek(video.currentTime);
+
+        if (video.paused) {
+          audio.pause();
+        }
+      };
+
+      const prepareMirror = async (videoID: string) => {
+        const generation = ++mirrorGeneration;
+        const url = await getStreamURL(videoID);
+
+        if (!url || generation !== mirrorGeneration || videoID !== currentVideoID) {
+          return;
         }
 
-        transitionAudio = new Howl({
+        const audio = new Howl({
           src: url,
           html5: true,
           volume: 0,
+          onload: () => {
+            if (
+              generation !== mirrorGeneration ||
+              videoID !== currentVideoID
+            ) {
+              audio.unload();
+              return;
+            }
+
+            transitionAudio?.unload();
+            transitionAudio = audio;
+            syncMirrorToVideo(audio);
+          },
+          onloaderror: (_id, error) => {
+            console.error('[crossfade] Failed to load transition audio', error);
+          },
         });
-        syncVideoWithTransitionAudio();
       };
 
-      const syncVideoWithTransitionAudio = () => {
-        const video = document.querySelector('video')!;
+      const fadeVideoIn = (targetVolume: number) => {
+        const duration = this.config?.fadeInDuration ?? 0;
 
-        const videoFader = new VolumeFader(video, {
-          fadeScaling: this.config?.fadeScaling,
-          fadeDuration: this.config?.fadeInDuration,
-        });
-
-        transitionAudio.play();
-        transitionAudio.seek(video.currentTime);
-
-        video.addEventListener('seeking', () => {
-          transitionAudio.seek(video.currentTime);
-        });
-
-        video.addEventListener('pause', () => {
-          transitionAudio.pause();
-        });
-
-        video.addEventListener('play', () => {
-          transitionAudio.play();
-          transitionAudio.seek(video.currentTime);
-
-          // Fade in
-          const videoVolume = video.volume;
-          video.volume = 0;
-          videoFader.fadeTo(videoVolume);
-        });
-
-        // Exit just before the end for the transition
-        const transitionBeforeEnd = () => {
-          if (
-            video.currentTime >=
-              video.duration - (this.config?.secondsBeforeEnd ?? 0) &&
-            isReadyToCrossfade()
-          ) {
-            video.removeEventListener('timeupdate', transitionBeforeEnd);
-
-            // Go to next video - XXX: does not support "repeat 1" mode
-            document.querySelector<HTMLButtonElement>('.next-button')?.click();
-          }
-        };
-
-        video.addEventListener('timeupdate', transitionBeforeEnd);
-      };
-
-      const crossfade = (cb: () => void) => {
-        if (!isReadyToCrossfade()) {
-          cb();
+        if (duration <= 0) {
+          video.volume = targetVolume;
           return;
         }
 
-        let resolveTransition: () => void;
-        waitForTransition = new Promise<void>((resolve) => {
-          resolveTransition = resolve;
-        });
-
-        const video = document.querySelector('video')!;
-
-        const fader = new VolumeFader(transitionAudio._sounds[0]._node, {
-          initialVolume: video.volume,
-          fadeScaling: this.config?.fadeScaling,
-          fadeDuration: this.config?.fadeOutDuration,
-        });
-
-        // Fade out the music
         video.volume = 0;
-        fader.fadeOut(() => {
-          resolveTransition();
-          cb();
-        });
+        new VolumeFader(video, {
+          fadeScaling: this.config?.fadeScaling,
+          fadeDuration: duration,
+        }).fadeTo(targetVolume);
       };
 
-      watchVideoIDChanges(async (videoID) => {
-        await waitForTransition;
-        const url = await getStreamURL(videoID);
-        if (!url) {
+      const beginOutgoingFade = () => {
+        if (!isReadyToCrossfade() || !transitionAudio) {
+          return false;
+        }
+
+        const outgoingAudio = transitionAudio;
+        const outgoingNode = outgoingAudio._sounds[0]?._node;
+
+        if (!(outgoingNode instanceof HTMLMediaElement)) {
+          return false;
+        }
+
+        incomingVolume = video.volume;
+        awaitingIncomingFade = true;
+        transitionAudio = undefined;
+        video.volume = 0;
+
+        const duration = this.config?.fadeOutDuration ?? 0;
+        if (duration <= 0) {
+          outgoingNode.volume = 0;
+          outgoingAudio.unload();
+          return true;
+        }
+
+        new VolumeFader(outgoingNode, {
+          initialVolume: incomingVolume,
+          fadeScaling: this.config?.fadeScaling,
+          fadeDuration: duration,
+        }).fadeOut(() => {
+          outgoingAudio.unload();
+        });
+
+        return true;
+      };
+
+      video.addEventListener('seeking', () => {
+        if (transitionAudio?.state() === 'loaded') {
+          transitionAudio.seek(video.currentTime);
+        }
+      });
+
+      video.addEventListener('pause', () => {
+        transitionAudio?.pause();
+      });
+
+      video.addEventListener('play', () => {
+        if (transitionAudio?.state() === 'loaded') {
+          syncMirrorToVideo(transitionAudio);
+        }
+      });
+
+      video.addEventListener('timeupdate', () => {
+        if (
+          !currentVideoID ||
+          transitionTriggeredForVideoID === currentVideoID ||
+          !Number.isFinite(video.duration) ||
+          video.currentTime <
+            video.duration - (this.config?.secondsBeforeEnd ?? 0) ||
+          !isReadyToCrossfade()
+        ) {
           return;
         }
 
-        createAudioForCrossfade(url);
+        transitionTriggeredForVideoID = currentVideoID;
+
+        if (beginOutgoingFade()) {
+          api.nextVideo();
+        }
       });
+
+      api.addEventListener('videodatachange', (name, videoData) => {
+        if (name !== 'dataloaded' || !videoData.videoId) {
+          return;
+        }
+
+        const nextVideoID = videoData.videoId;
+        if (nextVideoID === currentVideoID) {
+          return;
+        }
+
+        // A manual skip does not pass through the near-end trigger, so start the
+        // outgoing fade here while the old mirrored track is still available.
+        if (!awaitingIncomingFade) {
+          beginOutgoingFade();
+        }
+
+        currentVideoID = nextVideoID;
+        transitionTriggeredForVideoID = undefined;
+
+        if (awaitingIncomingFade) {
+          const targetVolume = incomingVolume;
+          awaitingIncomingFade = false;
+          fadeVideoIn(targetVolume);
+        }
+
+        void prepareMirror(nextVideoID);
+      });
+
+      if (currentVideoID) {
+        void prepareMirror(currentVideoID);
+      }
     },
   },
 });
