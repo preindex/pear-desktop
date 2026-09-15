@@ -170,18 +170,42 @@ export default createPlugin<
       fetch: getNetFetchAsFetch(),
     });
 
-    ipc.handle('audio-url', async (videoID: string) => {
-      const format = await yt.getStreamingData(videoID, {
-        type: 'audio',
-        quality: 'best',
-        format: 'any',
-      });
+    const streamingClients = [
+      'ANDROID_VR',
+      'TV',
+      'WEB_EMBEDDED',
+    ] as const;
 
-      if (!format.url) {
-        throw new Error(`No audio stream URL returned for ${videoID}`);
+    ipc.handle('audio-url', async (videoID: string) => {
+      const failures: string[] = [];
+
+      for (const client of streamingClients) {
+        try {
+          const format = await yt.getStreamingData(videoID, {
+            client,
+            type: 'audio',
+            quality: 'best',
+            format: 'any',
+          });
+
+          if (format.url) {
+            console.info(
+              `[crossfade] Using ${client} audio stream for ${videoID}`,
+            );
+            return format.url;
+          }
+
+          failures.push(`${client}: no URL`);
+        } catch (error) {
+          failures.push(
+            `${client}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
       }
 
-      return format.url;
+      throw new Error(
+        `No usable audio stream for ${videoID} (${failures.join('; ')})`,
+      );
     });
   },
 
