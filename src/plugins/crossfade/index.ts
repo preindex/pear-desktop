@@ -183,7 +183,7 @@ export default createPlugin<
     },
     onPlayerApiReady() {
       const api = document.querySelector<Element & MusicPlayer>('#movie_player');
-      const video = document.querySelector<HTMLVideoElement>('video');
+      const video = api?.querySelector<HTMLVideoElement>('video');
 
       if (!api || !video) {
         console.error('[crossfade] Player API or video element is unavailable');
@@ -253,9 +253,9 @@ export default createPlugin<
 
       const syncMirrorToVideo = (audio: Howl) => {
         audio.play();
-        audio.seek(video.currentTime);
+        audio.seek(api.getCurrentTime());
 
-        if (video.paused) {
+        if (api.getPlayerState() !== 1) {
           audio.pause();
         }
       };
@@ -360,7 +360,7 @@ export default createPlugin<
 
       video.addEventListener('seeking', () => {
         if (transitionAudio?.state() === 'loaded') {
-          transitionAudio.seek(video.currentTime);
+          transitionAudio.seek(api.getCurrentTime());
         }
       });
 
@@ -374,24 +374,41 @@ export default createPlugin<
         }
       });
 
-      video.addEventListener('timeupdate', () => {
+      const checkForCrossfade = () => {
+        const currentTime = api.getCurrentTime();
+        const duration = api.getDuration();
+        const secondsBeforeEnd = this.config?.secondsBeforeEnd ?? 0;
+
         if (
           !currentVideoID ||
           transitionTriggeredForVideoID === currentVideoID ||
-          !Number.isFinite(video.duration) ||
-          video.currentTime <
-            video.duration - (this.config?.secondsBeforeEnd ?? 0) ||
+          api.getPlayerState() !== 1 ||
+          !Number.isFinite(currentTime) ||
+          !Number.isFinite(duration) ||
+          duration <= 0 ||
+          currentTime < duration - secondsBeforeEnd ||
           !isReadyToCrossfade()
         ) {
           return;
         }
 
+        console.info('[crossfade] Triggering transition', {
+          videoID: currentVideoID,
+          currentTime,
+          duration,
+          secondsBeforeEnd,
+        });
+
         transitionTriggeredForVideoID = currentVideoID;
 
         if (beginOutgoingFade()) {
           api.nextVideo();
+        } else {
+          transitionTriggeredForVideoID = undefined;
         }
-      });
+      };
+
+      window.setInterval(checkForCrossfade, 200);
 
       api.addEventListener('videodatachange', (name, videoData) => {
         if (name !== 'dataloaded' || !videoData.videoId) {
