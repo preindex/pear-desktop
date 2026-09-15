@@ -219,7 +219,10 @@ export default createPlugin<
             videoID,
           );
 
-          if (typeof response !== 'string' || !response.startsWith('data:audio/')) {
+          if (
+            typeof response !== 'string' ||
+            !response.startsWith('data:audio/')
+          ) {
             console.error(
               '[crossfade] Invalid buffered audio response',
               videoID,
@@ -374,41 +377,71 @@ export default createPlugin<
         }
       });
 
-      const checkForCrossfade = () => {
-        const currentTime = api.getCurrentTime();
-        const duration = api.getDuration();
+      const progressBar = document.querySelector<
+        HTMLElement & { value: string; max?: string }
+      >('#progress-bar');
+
+      const checkForCrossfade = (elapsed?: number) => {
+        const progressValue =
+          elapsed ??
+          Number(progressBar?.value ?? progressBar?.getAttribute('value'));
+        const progressMax = Number(
+          progressBar?.max ?? progressBar?.getAttribute('max'),
+        );
+        const duration = Number.isFinite(progressMax) && progressMax > 0
+          ? progressMax
+          : api.getDuration();
         const secondsBeforeEnd = this.config?.secondsBeforeEnd ?? 0;
 
         if (
           !currentVideoID ||
           transitionTriggeredForVideoID === currentVideoID ||
-          api.getPlayerState() !== 1 ||
-          !Number.isFinite(currentTime) ||
+          !Number.isFinite(progressValue) ||
           !Number.isFinite(duration) ||
           duration <= 0 ||
-          currentTime < duration - secondsBeforeEnd ||
-          !isReadyToCrossfade()
+          progressValue < duration - secondsBeforeEnd
         ) {
           return;
         }
 
-        console.info('[crossfade] Triggering transition', {
+        console.info('[crossfade] Crossfade threshold reached', {
           videoID: currentVideoID,
-          currentTime,
+          currentTime: progressValue,
           duration,
           secondsBeforeEnd,
+          mirrorReady: isReadyToCrossfade(),
         });
+
+        if (!isReadyToCrossfade()) {
+          return;
+        }
 
         transitionTriggeredForVideoID = currentVideoID;
 
         if (beginOutgoingFade()) {
+          console.info('[crossfade] Triggering transition', currentVideoID);
           api.nextVideo();
         } else {
           transitionTriggeredForVideoID = undefined;
         }
       };
 
-      window.setInterval(checkForCrossfade, 200);
+      if (progressBar) {
+        const progressObserver = new MutationObserver((mutations) => {
+          for (const mutation of mutations) {
+            const target = mutation.target as HTMLElement & { value: string };
+            checkForCrossfade(Number(target.value));
+          }
+        });
+
+        progressObserver.observe(progressBar, {
+          attributes: true,
+          attributeFilter: ['value'],
+        });
+        checkForCrossfade();
+      } else {
+        console.error('[crossfade] Progress bar is unavailable');
+      }
 
       api.addEventListener('videodatachange', (name, videoData) => {
         if (name !== 'dataloaded' || !videoData.videoId) {
