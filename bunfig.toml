@@ -1,0 +1,3 @@
+[install]
+minimumReleaseAge = 21600
+minimumReleaseAgeExcludes = ["vite"]
