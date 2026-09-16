@@ -209,7 +209,9 @@ export default createPlugin<
       api.__pearCrossfadeInitialized = true;
 
       const MIRROR_RETRY_DELAYS_MS = [1000, 2500, 5000, 8000] as const;
-      const MIRROR_THRESHOLD_GRACE_MS = 2000;
+      const MIRROR_THRESHOLD_MIN_GRACE_MS = 2000;
+      const MIRROR_THRESHOLD_MAX_GRACE_MS = 8000;
+      const MIRROR_FALLBACK_RESERVE_MS = 3000;
 
       let transitionAudio: Howl | undefined;
       let transitionAudioVideoID: string | undefined;
@@ -218,7 +220,6 @@ export default createPlugin<
       let transitionTriggeredForVideoID: string | undefined;
       let thresholdLoggedForVideoID: string | undefined;
       let incomingFadeVideoID: string | undefined;
-      let pendingVideoDataID: string | undefined;
       let incomingVolume = video.volume;
       let mirrorGeneration = 0;
       let mirrorRetryAttempt = 0;
@@ -408,6 +409,21 @@ export default createPlugin<
             void prepareMirror(videoID);
           }
         }, delay);
+      };
+
+      const ensureMirrorPreparation = (videoID = currentVideoID) => {
+        if (
+          !videoID ||
+          currentVideoID !== videoID ||
+          state !== 'idle' ||
+          isMirrorReady(videoID) ||
+          preparingVideoID === videoID ||
+          mirrorRetryTimeout !== undefined
+        ) {
+          return;
+        }
+
+        void prepareMirror(videoID);
       };
 
       prepareMirror = async (videoID: string) => {
@@ -615,6 +631,29 @@ export default createPlugin<
         return true;
       };
 
+      const cancelSequentialFade = (reason: string) => {
+        if (state !== 'fallback-fading') {
+          return false;
+        }
+
+        sequentialFadeGeneration += 1;
+        sequentialVideoFader?.stop();
+        sequentialVideoFader = undefined;
+        state = 'idle';
+        transitionTriggeredForVideoID = undefined;
+        thresholdLoggedForVideoID = undefined;
+        video.volume = incomingVolume;
+
+        console.info('[crossfade] Sequential fade cancelled', {
+          reason,
+          videoID: currentVideoID,
+          currentTime: getProgressValue(),
+        });
+
+        ensureMirrorPreparation();
+        return true;
+      };
+
       const fallbackToSequentialFade = (reason: unknown) =>
         startSequentialFade(reason);
 
@@ -734,6 +773,28 @@ export default createPlugin<
         return true;
       };
 
+      const getMirrorThresholdGrace = () => {
+        const progressValue = getProgressValue();
+        const duration = getDuration();
+
+        if (
+          !Number.isFinite(progressValue) ||
+          !Number.isFinite(duration) ||
+          duration <= progressValue
+        ) {
+          return MIRROR_THRESHOLD_MIN_GRACE_MS;
+        }
+
+        const remainingMs = (duration - progressValue) * 1000;
+        return Math.min(
+          MIRROR_THRESHOLD_MAX_GRACE_MS,
+          Math.max(
+            MIRROR_THRESHOLD_MIN_GRACE_MS,
+            remainingMs - MIRROR_FALLBACK_RESERVE_MS,
+          ),
+        );
+      };
+
       const armMirrorThresholdGrace = (videoID: string) => {
         if (
           mirrorThresholdGraceTimeout !== undefined ||
@@ -743,10 +804,18 @@ export default createPlugin<
           return;
         }
 
+        // At the threshold, retry immediately rather than waiting for an
+        // ordinary backoff timer. The full-track buffer can legitimately take
+        // more than two seconds after a seek, so give an in-flight request as
+        // much of the remaining song time as is safe before falling back.
+        clearMirrorRetryTimeout();
         void prepareMirror(videoID);
-        console.info('[crossfade] Waiting briefly for mirror at threshold', {
+        const grace = getMirrorThresholdGrace();
+        console.info('[crossfade] Waiting for mirror at threshold', {
           videoID,
-          grace: MIRROR_THRESHOLD_GRACE_MS,
+          grace,
+          preparing: preparingVideoID === videoID,
+          retryAttempt: mirrorRetryAttempt,
         });
 
         mirrorThresholdGraceTimeout = window.setTimeout(() => {
@@ -767,7 +836,7 @@ export default createPlugin<
           }
 
           startSequentialFade('mirror unavailable after threshold grace');
-        }, MIRROR_THRESHOLD_GRACE_MS);
+        }, grace);
       };
 
       const startIncomingFade = () => {
@@ -797,7 +866,6 @@ export default createPlugin<
         currentVideoID = activeVideoID;
         transitionTriggeredForVideoID = undefined;
         thresholdLoggedForVideoID = undefined;
-        pendingVideoDataID = undefined;
         clearMirrorStartTimeout();
         clearMirrorThresholdGrace();
         resetMirrorRetry();
@@ -850,16 +918,34 @@ export default createPlugin<
       };
 
       video.addEventListener('playing', () => {
-        handleActiveVideoChange(getActiveVideoID(), 'playing');
+        const activeVideoID = getActiveVideoID();
+        handleActiveVideoChange(activeVideoID, 'playing');
+        ensureMirrorPreparation(activeVideoID);
         startIncomingFade();
         checkForCrossfade();
       });
 
       video.addEventListener('play', () => {
+        ensureMirrorPreparation();
         checkForCrossfade();
       });
 
       video.addEventListener('seeked', () => {
+        const progressValue = getProgressValue();
+        const duration = getDuration();
+        const threshold =
+          duration - (this.config?.secondsBeforeEnd ?? 0);
+
+        if (
+          state === 'fallback-fading' &&
+          Number.isFinite(progressValue) &&
+          Number.isFinite(duration) &&
+          progressValue < threshold
+        ) {
+          cancelSequentialFade('seeked before crossfade threshold');
+        }
+
+        ensureMirrorPreparation();
         checkForCrossfade();
       });
 
@@ -886,6 +972,7 @@ export default createPlugin<
 
         if (progressValue < threshold) {
           clearMirrorThresholdGrace();
+          ensureMirrorPreparation(currentVideoID);
           if (thresholdLoggedForVideoID === currentVideoID) {
             thresholdLoggedForVideoID = undefined;
           }
@@ -896,9 +983,7 @@ export default createPlugin<
         // progress should only arm/prepare the transition. Resume/seeked will
         // immediately re-evaluate once playback is actually active.
         if (!isPlaybackActive()) {
-          if (!isMirrorReady()) {
-            void prepareMirror(currentVideoID);
-          }
+          ensureMirrorPreparation(currentVideoID);
           return;
         }
 
@@ -911,6 +996,8 @@ export default createPlugin<
             secondsBeforeEnd,
             mirrorVideoID: transitionAudioVideoID,
             mirrorReady: isMirrorReady(),
+            preparingVideoID,
+            mirrorRetryAttempt,
             paused: video.paused,
             seeking: video.seeking,
           });
@@ -947,18 +1034,13 @@ export default createPlugin<
         console.error('[crossfade] Progress bar is unavailable');
       }
 
-      api.addEventListener('videodatachange', (name, videoData) => {
-        if (name === 'dataloaded') {
-          pendingVideoDataID = videoData.videoId;
-          return;
-        }
-
-        if (
-          name === 'dataupdated' &&
-          pendingVideoDataID === videoData.videoId
-        ) {
-          pendingVideoDataID = undefined;
-          handleActiveVideoChange(videoData.videoId, 'dataupdated');
+      // `videodatachange` can describe a queued/preloaded track before the
+      // media element actually switches. Never use it to change active track
+      // identity. It is only safe as an extra nudge to prepare the mirror when
+      // its ID agrees with the already-confirmed active track.
+      api.addEventListener('videodatachange', (_name, videoData) => {
+        if (videoData.videoId === currentVideoID) {
+          ensureMirrorPreparation(currentVideoID);
         }
       });
 
