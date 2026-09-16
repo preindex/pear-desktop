@@ -288,6 +288,8 @@ export default createPlugin<
       };
 
       const getActiveVideoID = () => api.getVideoData().video_id;
+      const isPlaybackActive = () =>
+        !video.paused && !video.ended && !video.seeking;
 
       const isMirrorReady = (videoID = currentVideoID) =>
         transitionAudioVideoID === videoID &&
@@ -394,30 +396,40 @@ export default createPlugin<
         api.nextVideo();
       };
 
-      const fallbackToSequentialFade = (reason: unknown) => {
-        clearMirrorStartTimeout();
-
-        const failedMirror = transitionAudio;
-        transitionAudio = undefined;
-        transitionAudioVideoID = undefined;
-        failedMirror?.stop();
-        failedMirror?.unload();
-
-        if (state !== 'starting-mirror') {
-          return;
+      const startSequentialFade = (reason: unknown) => {
+        if (
+          !currentVideoID ||
+          (state !== 'idle' && state !== 'starting-mirror')
+        ) {
+          return false;
         }
 
+        clearMirrorStartTimeout();
+
+        if (transitionAudio) {
+          transitionAudio.stop();
+          transitionAudio.unload();
+          transitionAudio = undefined;
+          transitionAudioVideoID = undefined;
+        }
+
+        incomingVolume = video.volume;
+        transitionTriggeredForVideoID = currentVideoID;
         state = 'fallback-fading';
+
         const duration = this.config?.fadeOutDuration ?? 0;
-        console.warn(
-          '[crossfade] Mirror playback unavailable; using sequential fade',
+        console.warn('[crossfade] Using sequential fade', {
           reason,
-        );
+          videoID: currentVideoID,
+          currentTime: getProgressValue(),
+          duration,
+        });
 
         if (duration <= 0) {
           video.volume = 0;
+          console.info('[crossfade] Sequential outgoing fade complete');
           waitForIncomingTrack();
-          return;
+          return true;
         }
 
         new VolumeFader(video, {
@@ -427,7 +439,12 @@ export default createPlugin<
           console.info('[crossfade] Sequential outgoing fade complete');
           waitForIncomingTrack();
         });
+
+        return true;
       };
+
+      const fallbackToSequentialFade = (reason: unknown) =>
+        startSequentialFade(reason);
 
       const beginCrossfade = () => {
         if (
@@ -602,6 +619,15 @@ export default createPlugin<
       video.addEventListener('playing', () => {
         handleActiveVideoChange();
         startIncomingFade();
+        checkForCrossfade();
+      });
+
+      video.addEventListener('play', () => {
+        checkForCrossfade();
+      });
+
+      video.addEventListener('seeked', () => {
+        checkForCrossfade();
       });
 
       checkForCrossfade = (elapsed?: number) => {
@@ -633,6 +659,16 @@ export default createPlugin<
           return;
         }
 
+        // Crossing the threshold while paused or while a seek is still in
+        // progress should only arm/prepare the transition. Resume/seeked will
+        // immediately re-evaluate once playback is actually active.
+        if (!isPlaybackActive()) {
+          if (!isMirrorReady()) {
+            void prepareMirror(currentVideoID);
+          }
+          return;
+        }
+
         if (thresholdLoggedForVideoID !== currentVideoID) {
           thresholdLoggedForVideoID = currentVideoID;
           console.info('[crossfade] Crossfade threshold reached', {
@@ -642,6 +678,8 @@ export default createPlugin<
             secondsBeforeEnd,
             mirrorVideoID: transitionAudioVideoID,
             mirrorReady: isMirrorReady(),
+            paused: video.paused,
+            seeking: video.seeking,
           });
         }
 
@@ -651,6 +689,7 @@ export default createPlugin<
 
         if (!isMirrorReady()) {
           void prepareMirror(currentVideoID);
+          startSequentialFade('mirror not ready while threshold active');
           return;
         }
 
