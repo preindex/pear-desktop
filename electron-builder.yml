@@ -6,10 +6,10 @@ files:
   - assets
   - license
   - '!node_modules'
-  # The API server backend is emitted as a separate chunk and keeps `ws`
-  # as a runtime import. Keep it explicitly in the packaged app so installs
-  # produced from either pnpm's or Bun's node_modules layout can resolve it.
+  # Some dependencies are intentionally left as runtime imports by the
+  # Electron/Rolldown build. Keep those packages in the final application.
   - 'node_modules/ws/**'
+  - 'node_modules/undici/**'
   - 'node_modules/custom-electron-prompt/**'
   - 'node_modules/@ghostery/adblocker-electron-preload/**'
   - 'node_modules/@ffmpeg.wasm/core-mt/**'
