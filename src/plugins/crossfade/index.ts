@@ -27,6 +27,18 @@ type CrossfadeBufferedAudio = {
   format: CrossfadeAudioFormat;
 };
 
+type CrossfadeState =
+  | 'idle'
+  | 'starting-mirror'
+  | 'crossfading'
+  | 'fallback-fading'
+  | 'waiting-incoming';
+
+type CrossfadePlayer = Element &
+  MusicPlayer & {
+    __pearCrossfadeInitialized?: boolean;
+  };
+
 export default createPlugin<
   unknown,
   unknown,
@@ -113,9 +125,7 @@ export default createPlugin<
               },
             },
             {
-              label: t(
-                'plugins.crossfade.prompt.options.multi-input.fade-scaling.label',
-              ),
+              label: t('plugins.crossfade.prompt.options.multi-input.fade-scaling.label'),
               selectOptions: {
                 linear: t(
                   'plugins.crossfade.prompt.options.multi-input.fade-scaling.linear',
@@ -182,7 +192,7 @@ export default createPlugin<
       this.config = newConfig;
     },
     onPlayerApiReady() {
-      const api = document.querySelector<Element & MusicPlayer>('#movie_player');
+      const api = document.querySelector<CrossfadePlayer>('#movie_player');
       const video = api?.querySelector<HTMLVideoElement>('video');
       const progressBar = document.querySelector<
         HTMLElement & { value: string; max?: string }
@@ -193,14 +203,23 @@ export default createPlugin<
         return;
       }
 
+      if (api.__pearCrossfadeInitialized) {
+        return;
+      }
+      api.__pearCrossfadeInitialized = true;
+
       let transitionAudio: Howl | undefined;
       let transitionAudioVideoID: string | undefined;
+      let preparingVideoID: string | undefined;
       let currentVideoID = api.getVideoData().video_id;
       let transitionTriggeredForVideoID: string | undefined;
-      let awaitingIncomingFade = false;
+      let thresholdLoggedForVideoID: string | undefined;
       let incomingFadeVideoID: string | undefined;
       let incomingVolume = video.volume;
       let mirrorGeneration = 0;
+      let state: CrossfadeState = 'idle';
+      let mirrorStartTimeout: number | undefined;
+      let checkForCrossfade: (elapsed?: number) => void = () => undefined;
 
       const inferFormatFromDataUrl = (
         dataUrl: string,
@@ -258,28 +277,42 @@ export default createPlugin<
       const getProgressValue = () =>
         Number(progressBar?.value ?? progressBar?.getAttribute('value'));
 
-      const getActiveVideoID = () => api.getVideoData().video_id;
-
-      const isReadyToCrossfade = (videoID = currentVideoID) =>
-        transitionAudioVideoID === videoID &&
-        transitionAudio?.state() === 'loaded' &&
-        transitionAudio._sounds[0]?._node instanceof HTMLMediaElement;
-
-      const syncMirrorToVideo = (audio: Howl) => {
-        audio.play();
-
-        const progressValue = getProgressValue();
-        audio.seek(
-          Number.isFinite(progressValue) ? progressValue : api.getCurrentTime(),
+      const getDuration = () => {
+        const progressMax = Number(
+          progressBar?.max ?? progressBar?.getAttribute('max'),
         );
 
-        if (video.paused) {
-          audio.pause();
+        return Number.isFinite(progressMax) && progressMax > 0
+          ? progressMax
+          : api.getDuration();
+      };
+
+      const getActiveVideoID = () => api.getVideoData().video_id;
+
+      const isMirrorReady = (videoID = currentVideoID) =>
+        transitionAudioVideoID === videoID &&
+        transitionAudio?.state() === 'loaded';
+
+      const clearMirrorStartTimeout = () => {
+        if (mirrorStartTimeout !== undefined) {
+          window.clearTimeout(mirrorStartTimeout);
+          mirrorStartTimeout = undefined;
         }
       };
 
       const prepareMirror = async (videoID: string) => {
+        if (
+          !videoID ||
+          videoID !== getActiveVideoID() ||
+          preparingVideoID === videoID ||
+          (transitionAudioVideoID === videoID &&
+            transitionAudio?.state() !== 'unloaded')
+        ) {
+          return;
+        }
+
         const generation = ++mirrorGeneration;
+        preparingVideoID = videoID;
         const bufferedAudio = await getBufferedAudio(videoID);
 
         if (
@@ -287,13 +320,20 @@ export default createPlugin<
           generation !== mirrorGeneration ||
           videoID !== getActiveVideoID()
         ) {
+          if (preparingVideoID === videoID) {
+            preparingVideoID = undefined;
+          }
           return;
         }
 
         const audio = new Howl({
           src: [bufferedAudio.dataUrl],
           format: [bufferedAudio.format],
-          html5: true,
+          // Use WebAudio so an already-unlocked AudioContext can start the
+          // automatic transition without creating a new autoplay-gated
+          // HTMLMediaElement for every song.
+          html5: false,
+          preload: true,
           volume: 0,
           onload: () => {
             if (
@@ -307,18 +347,19 @@ export default createPlugin<
             transitionAudio?.unload();
             transitionAudio = audio;
             transitionAudioVideoID = videoID;
-            console.info('[crossfade] Buffered transition audio ready', videoID);
-            syncMirrorToVideo(audio);
+            preparingVideoID = undefined;
+            console.info('[crossfade] Transition audio ready', videoID);
+            checkForCrossfade();
           },
           onloaderror: (_id, error) => {
+            if (preparingVideoID === videoID) {
+              preparingVideoID = undefined;
+            }
             console.error(
-              '[crossfade] Failed to load buffered transition audio',
+              '[crossfade] Failed to load transition audio',
               bufferedAudio.format,
               error,
             );
-          },
-          onplayerror: (_id, error) => {
-            console.error('[crossfade] Failed to play transition audio', error);
           },
         });
       };
@@ -346,65 +387,172 @@ export default createPlugin<
         });
       };
 
-      const beginOutgoingFade = () => {
-        if (!isReadyToCrossfade() || !transitionAudio) {
+      const waitForIncomingTrack = () => {
+        state = 'waiting-incoming';
+        incomingFadeVideoID = undefined;
+        video.volume = 0;
+        api.nextVideo();
+      };
+
+      const fallbackToSequentialFade = (reason: unknown) => {
+        clearMirrorStartTimeout();
+
+        const failedMirror = transitionAudio;
+        transitionAudio = undefined;
+        transitionAudioVideoID = undefined;
+        failedMirror?.stop();
+        failedMirror?.unload();
+
+        if (state !== 'starting-mirror') {
+          return;
+        }
+
+        state = 'fallback-fading';
+        const duration = this.config?.fadeOutDuration ?? 0;
+        console.warn(
+          '[crossfade] Mirror playback unavailable; using sequential fade',
+          reason,
+        );
+
+        if (duration <= 0) {
+          video.volume = 0;
+          waitForIncomingTrack();
+          return;
+        }
+
+        new VolumeFader(video, {
+          fadeScaling: this.config?.fadeScaling,
+          fadeDuration: duration,
+        }).fadeTo(0, () => {
+          console.info('[crossfade] Sequential outgoing fade complete');
+          waitForIncomingTrack();
+        });
+      };
+
+      const beginCrossfade = () => {
+        if (
+          state !== 'idle' ||
+          !isMirrorReady() ||
+          !transitionAudio ||
+          !currentVideoID
+        ) {
           return false;
         }
 
         const outgoingAudio = transitionAudio;
+        const outgoingVideoID = currentVideoID;
         const progressValue = getProgressValue();
         const outgoingPosition = Number.isFinite(progressValue)
           ? progressValue
           : api.getCurrentTime();
+        const startVolume = video.volume;
+        const fadeDuration = this.config?.fadeOutDuration ?? 0;
+
+        incomingVolume = startVolume;
+        state = 'starting-mirror';
+        transitionTriggeredForVideoID = outgoingVideoID;
 
         outgoingAudio.seek(outgoingPosition);
-        if (!outgoingAudio.playing()) {
-          outgoingAudio.play();
-        }
+        outgoingAudio.volume(startVolume);
 
-        incomingVolume = video.volume;
-        awaitingIncomingFade = true;
-        incomingFadeVideoID = undefined;
-        transitionAudio = undefined;
-        transitionAudioVideoID = undefined;
+        let settled = false;
+        let soundID: number | undefined;
 
-        // Hand the audible signal from YouTube Music to the synchronized mirror.
-        // Use Howler's own volume state instead of changing its private media node.
-        outgoingAudio.volume(incomingVolume);
-        video.volume = 0;
+        const removeStartListeners = () => {
+          outgoingAudio.off('play', onMirrorPlay);
+          outgoingAudio.off('playerror', onMirrorPlayError);
+        };
 
-        const duration = this.config?.fadeOutDuration ?? 0;
-        console.info('[crossfade] Outgoing fade started', {
-          position: outgoingPosition,
-          volume: incomingVolume,
-          duration,
-        });
+        const onMirrorPlay = (id: number) => {
+          if (settled || state !== 'starting-mirror') {
+            return;
+          }
 
-        if (duration <= 0) {
-          outgoingAudio.volume(0);
-          outgoingAudio.unload();
+          settled = true;
+          soundID = id;
+          clearMirrorStartTimeout();
+          removeStartListeners();
+
+          transitionAudio = undefined;
+          transitionAudioVideoID = undefined;
+          state = 'crossfading';
+
+          // Only mute/switch YouTube Music after the outgoing mirror has
+          // definitely started. This prevents a failed mirror start from
+          // turning into a hard skip.
+          video.volume = 0;
+
+          console.info('[crossfade] Outgoing mirror confirmed', {
+            videoID: outgoingVideoID,
+            position: outgoingPosition,
+            volume: startVolume,
+            duration: fadeDuration,
+          });
+
+          if (fadeDuration <= 0) {
+            outgoingAudio.volume(0, soundID);
+            outgoingAudio.stop(soundID);
+            outgoingAudio.unload();
+          } else {
+            outgoingAudio.once(
+              'fade',
+              () => {
+                console.info('[crossfade] Outgoing fade complete');
+                outgoingAudio.stop(soundID);
+                outgoingAudio.unload();
+              },
+              soundID,
+            );
+            outgoingAudio.fade(startVolume, 0, fadeDuration, soundID);
+          }
+
+          console.info('[crossfade] Triggering next track', outgoingVideoID);
+          waitForIncomingTrack();
+        };
+
+        const onMirrorPlayError = (_id: number, error: unknown) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          removeStartListeners();
+          fallbackToSequentialFade(error);
+        };
+
+        outgoingAudio.once('play', onMirrorPlay);
+        outgoingAudio.once('playerror', onMirrorPlayError);
+
+        try {
+          const id = outgoingAudio.play();
+          if (typeof id === 'number') {
+            soundID = id;
+          }
+        } catch (error) {
+          onMirrorPlayError(soundID ?? 0, error);
           return true;
         }
 
-        outgoingAudio.once('fade', () => {
-          console.info('[crossfade] Outgoing fade complete');
-          outgoingAudio.unload();
-        });
-        outgoingAudio.fade(incomingVolume, 0, duration);
+        mirrorStartTimeout = window.setTimeout(() => {
+          if (!settled && state === 'starting-mirror') {
+            settled = true;
+            removeStartListeners();
+            fallbackToSequentialFade('mirror start timeout');
+          }
+        }, 750);
 
         return true;
       };
 
       const startIncomingFade = () => {
         if (
-          !awaitingIncomingFade ||
+          state !== 'waiting-incoming' ||
           !incomingFadeVideoID ||
           incomingFadeVideoID !== currentVideoID
         ) {
           return;
         }
 
-        awaitingIncomingFade = false;
+        state = 'idle';
         incomingFadeVideoID = undefined;
         fadeVideoIn(incomingVolume);
       };
@@ -417,18 +565,30 @@ export default createPlugin<
         }
 
         const previousVideoID = currentVideoID;
-
-        if (!awaitingIncomingFade && isReadyToCrossfade(previousVideoID)) {
-          beginOutgoingFade();
-        }
-
         currentVideoID = activeVideoID;
         transitionTriggeredForVideoID = undefined;
+        thresholdLoggedForVideoID = undefined;
 
-        if (awaitingIncomingFade) {
+        // A mirror for the previous active track is no longer useful unless it
+        // was already detached into a live outgoing crossfade.
+        if (
+          transitionAudio &&
+          transitionAudioVideoID &&
+          transitionAudioVideoID !== activeVideoID
+        ) {
+          transitionAudio.unload();
+          transitionAudio = undefined;
+          transitionAudioVideoID = undefined;
+        }
+        preparingVideoID = undefined;
+        mirrorGeneration += 1;
+
+        if (state === 'waiting-incoming' || state === 'crossfading') {
+          state = 'waiting-incoming';
           incomingFadeVideoID = activeVideoID;
-          // Keep the new track silent until playback has actually started.
           video.volume = 0;
+        } else if (state !== 'fallback-fading' && state !== 'starting-mirror') {
+          state = 'idle';
         }
 
         console.info('[crossfade] Active track changed', {
@@ -439,76 +599,62 @@ export default createPlugin<
         void prepareMirror(activeVideoID);
       };
 
-      video.addEventListener('seeking', () => {
-        if (isReadyToCrossfade() && transitionAudio) {
-          const progressValue = getProgressValue();
-          transitionAudio.seek(
-            Number.isFinite(progressValue) ? progressValue : api.getCurrentTime(),
-          );
-        }
-      });
-
-      video.addEventListener('pause', () => {
-        transitionAudio?.pause();
-      });
-
-      video.addEventListener('play', () => {
-        if (isReadyToCrossfade() && transitionAudio) {
-          syncMirrorToVideo(transitionAudio);
-        }
-      });
-
       video.addEventListener('playing', () => {
+        handleActiveVideoChange();
         startIncomingFade();
       });
 
-      const checkForCrossfade = (elapsed?: number) => {
+      checkForCrossfade = (elapsed?: number) => {
         handleActiveVideoChange();
-
-        // A progress update proves the new track's media clock has started.
-        // This is a reliable fallback if Chromium does not emit a fresh
-        // `playing` event when YouTube Music swaps sources on the same element.
         startIncomingFade();
+
+        if (state !== 'idle') {
+          return;
+        }
 
         const progressValue = elapsed ?? getProgressValue();
-        const progressMax = Number(
-          progressBar?.max ?? progressBar?.getAttribute('max'),
-        );
-        const duration = Number.isFinite(progressMax) && progressMax > 0
-          ? progressMax
-          : api.getDuration();
+        const duration = getDuration();
         const secondsBeforeEnd = this.config?.secondsBeforeEnd ?? 0;
+        const threshold = duration - secondsBeforeEnd;
 
         if (
           !currentVideoID ||
-          transitionTriggeredForVideoID === currentVideoID ||
           !Number.isFinite(progressValue) ||
           !Number.isFinite(duration) ||
-          duration <= 0 ||
-          progressValue < duration - secondsBeforeEnd
+          duration <= 0
         ) {
           return;
         }
 
-        console.info('[crossfade] Crossfade threshold reached', {
-          videoID: currentVideoID,
-          currentTime: progressValue,
-          duration,
-          secondsBeforeEnd,
-          mirrorVideoID: transitionAudioVideoID,
-          mirrorReady: isReadyToCrossfade(),
-        });
-
-        if (!isReadyToCrossfade()) {
+        if (progressValue < threshold) {
+          if (thresholdLoggedForVideoID === currentVideoID) {
+            thresholdLoggedForVideoID = undefined;
+          }
           return;
         }
 
-        transitionTriggeredForVideoID = currentVideoID;
+        if (thresholdLoggedForVideoID !== currentVideoID) {
+          thresholdLoggedForVideoID = currentVideoID;
+          console.info('[crossfade] Crossfade threshold reached', {
+            videoID: currentVideoID,
+            currentTime: progressValue,
+            duration,
+            secondsBeforeEnd,
+            mirrorVideoID: transitionAudioVideoID,
+            mirrorReady: isMirrorReady(),
+          });
+        }
 
-        if (beginOutgoingFade()) {
-          console.info('[crossfade] Triggering transition', currentVideoID);
-          api.nextVideo();
-        } else {
+        if (transitionTriggeredForVideoID === currentVideoID) {
+          return;
+        }
+
+        if (!isMirrorReady()) {
+          void prepareMirror(currentVideoID);
+          return;
+        }
+
+        if (!beginCrossfade()) {
           transitionTriggeredForVideoID = undefined;
         }
       };
@@ -531,14 +677,9 @@ export default createPlugin<
       }
 
       api.addEventListener('videodatachange', (name) => {
-        if (name !== 'dataloaded') {
-          return;
+        if (name === 'dataloaded') {
+          handleActiveVideoChange();
         }
-
-        // YouTube Music can emit dataloaded for a queued/preloaded track before
-        // it becomes the active player item. Always resolve identity from the
-        // player API rather than trusting the event payload.
-        handleActiveVideoChange();
       });
 
       if (currentVideoID) {
