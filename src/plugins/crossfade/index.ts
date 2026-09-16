@@ -389,10 +389,38 @@ export default createPlugin<
         });
       };
 
-      const waitForIncomingTrack = () => {
+      const waitForIncomingTrack = (outgoingVideoID?: string) => {
         state = 'waiting-incoming';
         incomingFadeVideoID = undefined;
         video.volume = 0;
+
+        const activeVideoID = getActiveVideoID();
+        if (
+          outgoingVideoID &&
+          activeVideoID &&
+          activeVideoID !== outgoingVideoID
+        ) {
+          currentVideoID = activeVideoID;
+          transitionTriggeredForVideoID = undefined;
+          thresholdLoggedForVideoID = undefined;
+          incomingFadeVideoID = activeVideoID;
+
+          console.info(
+            '[crossfade] Incoming track already active; skipping nextVideo',
+            {
+              outgoingVideoID,
+              incomingVideoID: activeVideoID,
+            },
+          );
+
+          if (isPlaybackActive()) {
+            state = 'idle';
+            incomingFadeVideoID = undefined;
+            fadeVideoIn(incomingVolume);
+          }
+          return;
+        }
+
         api.nextVideo();
       };
 
@@ -404,6 +432,7 @@ export default createPlugin<
           return false;
         }
 
+        const outgoingVideoID = currentVideoID;
         clearMirrorStartTimeout();
 
         if (transitionAudio) {
@@ -414,13 +443,13 @@ export default createPlugin<
         }
 
         incomingVolume = video.volume;
-        transitionTriggeredForVideoID = currentVideoID;
+        transitionTriggeredForVideoID = outgoingVideoID;
         state = 'fallback-fading';
 
         const duration = this.config?.fadeOutDuration ?? 0;
         console.warn('[crossfade] Using sequential fade', {
           reason,
-          videoID: currentVideoID,
+          videoID: outgoingVideoID,
           currentTime: getProgressValue(),
           duration,
         });
@@ -428,7 +457,7 @@ export default createPlugin<
         if (duration <= 0) {
           video.volume = 0;
           console.info('[crossfade] Sequential outgoing fade complete');
-          waitForIncomingTrack();
+          waitForIncomingTrack(outgoingVideoID);
           return true;
         }
 
@@ -437,7 +466,7 @@ export default createPlugin<
           fadeDuration: duration,
         }).fadeTo(0, () => {
           console.info('[crossfade] Sequential outgoing fade complete');
-          waitForIncomingTrack();
+          waitForIncomingTrack(outgoingVideoID);
         });
 
         return true;
@@ -524,7 +553,7 @@ export default createPlugin<
           }
 
           console.info('[crossfade] Triggering next track', outgoingVideoID);
-          waitForIncomingTrack();
+          waitForIncomingTrack(outgoingVideoID);
         };
 
         const onMirrorPlayError = (_id: number, error: unknown) => {
