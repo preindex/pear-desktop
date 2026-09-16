@@ -624,8 +624,7 @@ export default createPlugin<
         }
       };
 
-      const handleActiveTrack = () => {
-        const activeVideoID = getActiveVideoID();
+      const handleActiveTrack = (activeVideoID = getActiveVideoID()) => {
         if (!activeVideoID || activeVideoID === currentVideoID) {
           return;
         }
@@ -681,6 +680,16 @@ export default createPlugin<
           if (thresholdLoggedVideoID === currentVideoID) {
             thresholdLoggedVideoID = undefined;
           }
+
+          if (
+            transitionTriggeredVideoID === currentVideoID &&
+            !incomingFadePending &&
+            !startingMirrorVideoID
+          ) {
+            transitionTriggeredVideoID = undefined;
+            console.info('[crossfade] Transition re-armed', currentVideoID);
+            ensureMirrorPreparation();
+          }
           return;
         }
 
@@ -713,7 +722,9 @@ export default createPlugin<
       }
 
       video.addEventListener('playing', () => {
-        handleActiveTrack();
+        // During `playing`, getVideoData() corresponds to the media that
+        // actually started. URL/playlist state can lag briefly when going back.
+        handleActiveTrack(api.getVideoData().video_id || getActiveVideoID());
         ensureMirrorPreparation();
         checkForCrossfade();
       });
