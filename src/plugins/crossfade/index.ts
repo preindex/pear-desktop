@@ -198,6 +198,7 @@ export default createPlugin<
       let currentVideoID = api.getVideoData().video_id;
       let transitionTriggeredForVideoID: string | undefined;
       let awaitingIncomingFade = false;
+      let incomingFadeVideoID: string | undefined;
       let incomingVolume = video.volume;
       let mirrorGeneration = 0;
 
@@ -327,14 +328,22 @@ export default createPlugin<
 
         if (duration <= 0) {
           video.volume = targetVolume;
+          console.info('[crossfade] Incoming audio restored immediately');
           return;
         }
 
         video.volume = 0;
+        console.info('[crossfade] Incoming fade started', {
+          targetVolume,
+          duration,
+        });
+
         new VolumeFader(video, {
           fadeScaling: this.config?.fadeScaling,
           fadeDuration: duration,
-        }).fadeTo(targetVolume);
+        }).fadeTo(targetVolume, () => {
+          console.info('[crossfade] Incoming fade complete');
+        });
       };
 
       const beginOutgoingFade = () => {
@@ -343,38 +352,61 @@ export default createPlugin<
         }
 
         const outgoingAudio = transitionAudio;
-        const outgoingNode = outgoingAudio._sounds[0]?._node;
+        const progressValue = getProgressValue();
+        const outgoingPosition = Number.isFinite(progressValue)
+          ? progressValue
+          : api.getCurrentTime();
 
-        if (!(outgoingNode instanceof HTMLMediaElement)) {
-          return false;
-        }
-
+        outgoingAudio.seek(outgoingPosition);
         if (!outgoingAudio.playing()) {
           outgoingAudio.play();
         }
 
         incomingVolume = video.volume;
         awaitingIncomingFade = true;
+        incomingFadeVideoID = undefined;
         transitionAudio = undefined;
         transitionAudioVideoID = undefined;
+
+        // Hand the audible signal from YouTube Music to the synchronized mirror.
+        // Use Howler's own volume state instead of changing its private media node.
+        outgoingAudio.volume(incomingVolume);
         video.volume = 0;
 
         const duration = this.config?.fadeOutDuration ?? 0;
+        console.info('[crossfade] Outgoing fade started', {
+          position: outgoingPosition,
+          volume: incomingVolume,
+          duration,
+        });
+
         if (duration <= 0) {
-          outgoingNode.volume = 0;
+          outgoingAudio.volume(0);
           outgoingAudio.unload();
           return true;
         }
 
-        new VolumeFader(outgoingNode, {
-          initialVolume: incomingVolume,
-          fadeScaling: this.config?.fadeScaling,
-          fadeDuration: duration,
-        }).fadeOut(() => {
+        outgoingAudio.once('fade', () => {
+          console.info('[crossfade] Outgoing fade complete');
           outgoingAudio.unload();
         });
+        outgoingAudio.fade(incomingVolume, 0, duration);
 
         return true;
+      };
+
+      const startIncomingFade = () => {
+        if (
+          !awaitingIncomingFade ||
+          !incomingFadeVideoID ||
+          incomingFadeVideoID !== currentVideoID
+        ) {
+          return;
+        }
+
+        awaitingIncomingFade = false;
+        incomingFadeVideoID = undefined;
+        fadeVideoIn(incomingVolume);
       };
 
       const handleActiveVideoChange = () => {
@@ -394,9 +426,9 @@ export default createPlugin<
         transitionTriggeredForVideoID = undefined;
 
         if (awaitingIncomingFade) {
-          const targetVolume = incomingVolume;
-          awaitingIncomingFade = false;
-          fadeVideoIn(targetVolume);
+          incomingFadeVideoID = activeVideoID;
+          // Keep the new track silent until playback has actually started.
+          video.volume = 0;
         }
 
         console.info('[crossfade] Active track changed', {
@@ -426,8 +458,17 @@ export default createPlugin<
         }
       });
 
+      video.addEventListener('playing', () => {
+        startIncomingFade();
+      });
+
       const checkForCrossfade = (elapsed?: number) => {
         handleActiveVideoChange();
+
+        // A progress update proves the new track's media clock has started.
+        // This is a reliable fallback if Chromium does not emit a fresh
+        // `playing` event when YouTube Music swaps sources on the same element.
+        startIncomingFade();
 
         const progressValue = elapsed ?? getProgressValue();
         const progressMax = Number(
