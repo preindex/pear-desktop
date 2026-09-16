@@ -540,15 +540,15 @@ export default createPlugin<
 
         const outgoingVideoID = currentVideoID;
         const outgoingAudio = transitionAudio;
-        const position = getProgressValue();
+        const position = video.currentTime;
         const startVolume = video.volume;
         let settled = false;
 
         startingMirrorVideoID = outgoingVideoID;
-        outgoingAudio.seek(
-          Number.isFinite(position) ? position : api.getCurrentTime(),
-        );
-        outgoingAudio.volume(startVolume);
+        outgoingAudio.seek(position);
+        // Start the mirror silently. Only expose it after Howler confirms
+        // playback and we have re-synced it to the live media clock.
+        outgoingAudio.volume(0);
 
         const removeListeners = () => {
           outgoingAudio.off('play', onPlay);
@@ -584,12 +584,18 @@ export default createPlugin<
           incomingVolume = startVolume;
           incomingFadePending = true;
 
+          // The mirror may have taken a few milliseconds to begin. Re-sync
+          // while it is still silent, then atomically hand audible output over
+          // from YouTube Music to the mirror.
+          const handoffPosition = video.currentTime;
+          outgoingAudio.seek(handoffPosition, soundID);
           video.volume = 0;
+          outgoingAudio.volume(startVolume, soundID);
           fadeMirrorOut(outgoingAudio, soundID, startVolume);
 
           console.info('[crossfade] Outgoing mirror confirmed', {
             videoID: outgoingVideoID,
-            position,
+            position: handoffPosition,
           });
           api.nextVideo();
         };
