@@ -208,17 +208,27 @@ export default createPlugin<
       }
       api.__pearCrossfadeInitialized = true;
 
+      const MIRROR_RETRY_DELAYS_MS = [1000, 2500, 5000, 8000] as const;
+      const MIRROR_THRESHOLD_GRACE_MS = 2000;
+
       let transitionAudio: Howl | undefined;
       let transitionAudioVideoID: string | undefined;
       let preparingVideoID: string | undefined;
-      let currentVideoID = api.getVideoData().video_id;
+      let currentVideoID: string | undefined;
       let transitionTriggeredForVideoID: string | undefined;
       let thresholdLoggedForVideoID: string | undefined;
       let incomingFadeVideoID: string | undefined;
+      let pendingVideoDataID: string | undefined;
       let incomingVolume = video.volume;
       let mirrorGeneration = 0;
+      let mirrorRetryAttempt = 0;
+      let mirrorRetryVideoID: string | undefined;
+      let sequentialFadeGeneration = 0;
+      let sequentialVideoFader: VolumeFader | undefined;
       let state: CrossfadeState = 'idle';
       let mirrorStartTimeout: number | undefined;
+      let mirrorRetryTimeout: number | undefined;
+      let mirrorThresholdGraceTimeout: number | undefined;
       let checkForCrossfade: (elapsed?: number) => void = () => undefined;
 
       const inferFormatFromDataUrl = (
@@ -287,7 +297,38 @@ export default createPlugin<
           : api.getDuration();
       };
 
-      const getActiveVideoID = () => api.getVideoData().video_id;
+      const getPlaylistVideoID = () => {
+        try {
+          const playlist = api.getPlaylist<string[]>();
+          const playlistIndex = api.getPlaylistIndex();
+          const videoID = playlist?.[playlistIndex];
+
+          return typeof videoID === 'string' && videoID.length > 0
+            ? videoID
+            : undefined;
+        } catch {
+          return undefined;
+        }
+      };
+
+      const getVideoIDFromURL = () => {
+        try {
+          const url = api.getVideoUrl();
+          return url
+            ? (new URL(url).searchParams.get('v') ?? undefined)
+            : undefined;
+        } catch {
+          return undefined;
+        }
+      };
+
+      const getActiveVideoID = () =>
+        getVideoIDFromURL() ??
+        getPlaylistVideoID() ??
+        api.getVideoData().video_id;
+
+      currentVideoID = getActiveVideoID();
+
       const isPlaybackActive = () =>
         !video.paused && !video.ended && !video.seeking;
 
@@ -302,10 +343,77 @@ export default createPlugin<
         }
       };
 
-      const prepareMirror = async (videoID: string) => {
+      const clearMirrorRetryTimeout = () => {
+        if (mirrorRetryTimeout !== undefined) {
+          window.clearTimeout(mirrorRetryTimeout);
+          mirrorRetryTimeout = undefined;
+        }
+      };
+
+      const resetMirrorRetry = () => {
+        clearMirrorRetryTimeout();
+        mirrorRetryAttempt = 0;
+        mirrorRetryVideoID = undefined;
+      };
+
+      const clearMirrorThresholdGrace = () => {
+        if (mirrorThresholdGraceTimeout !== undefined) {
+          window.clearTimeout(mirrorThresholdGraceTimeout);
+          mirrorThresholdGraceTimeout = undefined;
+        }
+      };
+
+      let prepareMirror: (videoID: string) => Promise<void>;
+
+      const scheduleMirrorRetry = (videoID: string) => {
         if (
           !videoID ||
-          videoID !== getActiveVideoID() ||
+          currentVideoID !== videoID ||
+          state !== 'idle' ||
+          isMirrorReady(videoID)
+        ) {
+          return;
+        }
+
+        if (mirrorRetryVideoID !== videoID) {
+          resetMirrorRetry();
+          mirrorRetryVideoID = videoID;
+        }
+
+        if (mirrorRetryTimeout !== undefined) {
+          return;
+        }
+
+        const retryIndex = Math.min(
+          mirrorRetryAttempt,
+          MIRROR_RETRY_DELAYS_MS.length - 1,
+        );
+        const delay = MIRROR_RETRY_DELAYS_MS[retryIndex];
+        mirrorRetryAttempt += 1;
+
+        console.warn('[crossfade] Scheduling mirror retry', {
+          videoID,
+          attempt: mirrorRetryAttempt,
+          delay,
+        });
+
+        mirrorRetryTimeout = window.setTimeout(() => {
+          mirrorRetryTimeout = undefined;
+
+          if (
+            currentVideoID === videoID &&
+            state === 'idle' &&
+            !isMirrorReady(videoID)
+          ) {
+            void prepareMirror(videoID);
+          }
+        }, delay);
+      };
+
+      prepareMirror = async (videoID: string) => {
+        if (
+          !videoID ||
+          videoID !== currentVideoID ||
           preparingVideoID === videoID ||
           (transitionAudioVideoID === videoID &&
             transitionAudio?.state() !== 'unloaded')
@@ -313,17 +421,25 @@ export default createPlugin<
           return;
         }
 
+        clearMirrorRetryTimeout();
+
         const generation = ++mirrorGeneration;
         preparingVideoID = videoID;
         const bufferedAudio = await getBufferedAudio(videoID);
+        const ownsPreparation = () =>
+          generation === mirrorGeneration && preparingVideoID === videoID;
 
         if (
           !bufferedAudio ||
           generation !== mirrorGeneration ||
-          videoID !== getActiveVideoID()
+          videoID !== currentVideoID
         ) {
-          if (preparingVideoID === videoID) {
+          if (ownsPreparation()) {
             preparingVideoID = undefined;
+
+            if (!bufferedAudio && currentVideoID === videoID) {
+              scheduleMirrorRetry(videoID);
+            }
           }
           return;
         }
@@ -340,7 +456,7 @@ export default createPlugin<
           onload: () => {
             if (
               generation !== mirrorGeneration ||
-              videoID !== getActiveVideoID()
+              videoID !== currentVideoID
             ) {
               audio.unload();
               return;
@@ -350,12 +466,14 @@ export default createPlugin<
             transitionAudio = audio;
             transitionAudioVideoID = videoID;
             preparingVideoID = undefined;
+            resetMirrorRetry();
             console.info('[crossfade] Transition audio ready', videoID);
             checkForCrossfade();
           },
           onloaderror: (_id, error) => {
-            if (preparingVideoID === videoID) {
+            if (ownsPreparation()) {
               preparingVideoID = undefined;
+              scheduleMirrorRetry(videoID);
             }
             console.error(
               '[crossfade] Failed to load transition audio',
@@ -394,13 +512,15 @@ export default createPlugin<
         incomingFadeVideoID = undefined;
         video.volume = 0;
 
-        const activeVideoID = getActiveVideoID();
+        // currentVideoID only changes after a confirmed player transition.
+        // Do not consult getVideoData() here because YouTube may expose queued
+        // metadata before the media element has actually switched tracks.
+        const activeVideoID = currentVideoID;
         if (
           outgoingVideoID &&
           activeVideoID &&
           activeVideoID !== outgoingVideoID
         ) {
-          currentVideoID = activeVideoID;
           transitionTriggeredForVideoID = undefined;
           thresholdLoggedForVideoID = undefined;
           incomingFadeVideoID = activeVideoID;
@@ -433,7 +553,17 @@ export default createPlugin<
         }
 
         const outgoingVideoID = currentVideoID;
+        const fadeGeneration = ++sequentialFadeGeneration;
         clearMirrorStartTimeout();
+        clearMirrorThresholdGrace();
+        resetMirrorRetry();
+        sequentialVideoFader?.stop();
+        sequentialVideoFader = undefined;
+
+        // Any mirror request still in flight is no longer useful once we have
+        // committed to the sequential fallback.
+        mirrorGeneration += 1;
+        preparingVideoID = undefined;
 
         if (transitionAudio) {
           transitionAudio.stop();
@@ -451,7 +581,7 @@ export default createPlugin<
           reason,
           videoID: outgoingVideoID,
           currentTime: getProgressValue(),
-          duration,
+          fadeDuration: duration,
         });
 
         if (duration <= 0) {
@@ -461,10 +591,23 @@ export default createPlugin<
           return true;
         }
 
-        new VolumeFader(video, {
+        const fader = new VolumeFader(video, {
           fadeScaling: this.config?.fadeScaling,
           fadeDuration: duration,
-        }).fadeTo(0, () => {
+        });
+        sequentialVideoFader = fader;
+        fader.fadeTo(0, () => {
+          if (sequentialVideoFader === fader) {
+            sequentialVideoFader = undefined;
+          }
+
+          if (
+            fadeGeneration !== sequentialFadeGeneration ||
+            currentVideoID !== outgoingVideoID
+          ) {
+            return;
+          }
+
           console.info('[crossfade] Sequential outgoing fade complete');
           waitForIncomingTrack(outgoingVideoID);
         });
@@ -494,6 +637,8 @@ export default createPlugin<
         const startVolume = video.volume;
         const fadeDuration = this.config?.fadeOutDuration ?? 0;
 
+        clearMirrorThresholdGrace();
+        resetMirrorRetry();
         incomingVolume = startVolume;
         state = 'starting-mirror';
         transitionTriggeredForVideoID = outgoingVideoID;
@@ -589,6 +734,42 @@ export default createPlugin<
         return true;
       };
 
+      const armMirrorThresholdGrace = (videoID: string) => {
+        if (
+          mirrorThresholdGraceTimeout !== undefined ||
+          currentVideoID !== videoID ||
+          state !== 'idle'
+        ) {
+          return;
+        }
+
+        void prepareMirror(videoID);
+        console.info('[crossfade] Waiting briefly for mirror at threshold', {
+          videoID,
+          grace: MIRROR_THRESHOLD_GRACE_MS,
+        });
+
+        mirrorThresholdGraceTimeout = window.setTimeout(() => {
+          mirrorThresholdGraceTimeout = undefined;
+
+          if (
+            currentVideoID !== videoID ||
+            state !== 'idle' ||
+            transitionTriggeredForVideoID === videoID ||
+            !isPlaybackActive()
+          ) {
+            return;
+          }
+
+          if (isMirrorReady(videoID)) {
+            beginCrossfade();
+            return;
+          }
+
+          startSequentialFade('mirror unavailable after threshold grace');
+        }, MIRROR_THRESHOLD_GRACE_MS);
+      };
+
       const startIncomingFade = () => {
         if (
           state !== 'waiting-incoming' ||
@@ -603,17 +784,28 @@ export default createPlugin<
         fadeVideoIn(incomingVolume);
       };
 
-      const handleActiveVideoChange = () => {
-        const activeVideoID = getActiveVideoID();
-
+      const handleActiveVideoChange = (
+        activeVideoID = getActiveVideoID(),
+        source = 'player',
+      ) => {
         if (!activeVideoID || activeVideoID === currentVideoID) {
           return;
         }
 
         const previousVideoID = currentVideoID;
+        const previousState = state;
         currentVideoID = activeVideoID;
         transitionTriggeredForVideoID = undefined;
         thresholdLoggedForVideoID = undefined;
+        pendingVideoDataID = undefined;
+        clearMirrorStartTimeout();
+        clearMirrorThresholdGrace();
+        resetMirrorRetry();
+
+        // Invalidate any old request, even when the same video ID is revisited
+        // later. Stale completions must never clear or replace newer state.
+        mirrorGeneration += 1;
+        preparingVideoID = undefined;
 
         // A mirror for the previous active track is no longer useful unless it
         // was already detached into a live outgoing crossfade.
@@ -626,27 +818,39 @@ export default createPlugin<
           transitionAudio = undefined;
           transitionAudioVideoID = undefined;
         }
-        preparingVideoID = undefined;
-        mirrorGeneration += 1;
 
-        if (state === 'waiting-incoming' || state === 'crossfading') {
+        if (previousState === 'fallback-fading') {
+          // Prevent the old fallback from continuing to control the incoming
+          // track or advancing the queue after the real track change.
+          sequentialFadeGeneration += 1;
+          sequentialVideoFader?.stop();
+          sequentialVideoFader = undefined;
+        }
+
+        if (
+          previousState === 'waiting-incoming' ||
+          previousState === 'crossfading' ||
+          previousState === 'fallback-fading'
+        ) {
           state = 'waiting-incoming';
           incomingFadeVideoID = activeVideoID;
           video.volume = 0;
-        } else if (state !== 'fallback-fading' && state !== 'starting-mirror') {
+        } else {
           state = 'idle';
+          incomingFadeVideoID = undefined;
         }
 
         console.info('[crossfade] Active track changed', {
           from: previousVideoID,
           to: activeVideoID,
+          source,
         });
 
         void prepareMirror(activeVideoID);
       };
 
       video.addEventListener('playing', () => {
-        handleActiveVideoChange();
+        handleActiveVideoChange(getActiveVideoID(), 'playing');
         startIncomingFade();
         checkForCrossfade();
       });
@@ -660,7 +864,6 @@ export default createPlugin<
       });
 
       checkForCrossfade = (elapsed?: number) => {
-        handleActiveVideoChange();
         startIncomingFade();
 
         if (state !== 'idle') {
@@ -682,6 +885,7 @@ export default createPlugin<
         }
 
         if (progressValue < threshold) {
+          clearMirrorThresholdGrace();
           if (thresholdLoggedForVideoID === currentVideoID) {
             thresholdLoggedForVideoID = undefined;
           }
@@ -717,8 +921,7 @@ export default createPlugin<
         }
 
         if (!isMirrorReady()) {
-          void prepareMirror(currentVideoID);
-          startSequentialFade('mirror not ready while threshold active');
+          armMirrorThresholdGrace(currentVideoID);
           return;
         }
 
@@ -744,9 +947,18 @@ export default createPlugin<
         console.error('[crossfade] Progress bar is unavailable');
       }
 
-      api.addEventListener('videodatachange', (name) => {
+      api.addEventListener('videodatachange', (name, videoData) => {
         if (name === 'dataloaded') {
-          handleActiveVideoChange();
+          pendingVideoDataID = videoData.videoId;
+          return;
+        }
+
+        if (
+          name === 'dataupdated' &&
+          pendingVideoDataID === videoData.videoId
+        ) {
+          pendingVideoDataID = undefined;
+          handleActiveVideoChange(videoData.videoId, 'dataupdated');
         }
       });
 
