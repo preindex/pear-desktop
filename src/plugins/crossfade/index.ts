@@ -224,6 +224,7 @@ export default createPlugin<
       let mirrorRetryAttempt = 0;
       let mirrorRetryVideoID: string | undefined;
       let sequentialFadeGeneration = 0;
+      let sequentialVideoFader: VolumeFader | undefined;
       let state: CrossfadeState = 'idle';
       let mirrorStartTimeout: number | undefined;
       let mirrorRetryTimeout: number | undefined;
@@ -313,15 +314,17 @@ export default createPlugin<
       const getVideoIDFromURL = () => {
         try {
           const url = api.getVideoUrl();
-          return url ? (new URL(url).searchParams.get('v') ?? undefined) : undefined;
+          return url
+            ? (new URL(url).searchParams.get('v') ?? undefined)
+            : undefined;
         } catch {
           return undefined;
         }
       };
 
       const getActiveVideoID = () =>
-        getPlaylistVideoID() ??
         getVideoIDFromURL() ??
+        getPlaylistVideoID() ??
         api.getVideoData().video_id;
 
       currentVideoID = getActiveVideoID();
@@ -360,8 +363,7 @@ export default createPlugin<
         }
       };
 
-      let prepareMirror: (videoID: string) => Promise<void> = async () =>
-        undefined;
+      let prepareMirror: (videoID: string) => Promise<void>;
 
       const scheduleMirrorRetry = (videoID: string) => {
         if (
@@ -555,6 +557,8 @@ export default createPlugin<
         clearMirrorStartTimeout();
         clearMirrorThresholdGrace();
         resetMirrorRetry();
+        sequentialVideoFader?.stop();
+        sequentialVideoFader = undefined;
 
         // Any mirror request still in flight is no longer useful once we have
         // committed to the sequential fallback.
@@ -587,10 +591,16 @@ export default createPlugin<
           return true;
         }
 
-        new VolumeFader(video, {
+        const fader = new VolumeFader(video, {
           fadeScaling: this.config?.fadeScaling,
           fadeDuration: duration,
-        }).fadeTo(0, () => {
+        });
+        sequentialVideoFader = fader;
+        fader.fadeTo(0, () => {
+          if (sequentialVideoFader === fader) {
+            sequentialVideoFader = undefined;
+          }
+
           if (
             fadeGeneration !== sequentialFadeGeneration ||
             currentVideoID !== outgoingVideoID
@@ -810,9 +820,11 @@ export default createPlugin<
         }
 
         if (previousState === 'fallback-fading') {
-          // Prevent the old fallback callback from advancing the queue after a
-          // real track change has already happened.
+          // Prevent the old fallback from continuing to control the incoming
+          // track or advancing the queue after the real track change.
           sequentialFadeGeneration += 1;
+          sequentialVideoFader?.stop();
+          sequentialVideoFader = undefined;
         }
 
         if (
