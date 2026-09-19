@@ -18,13 +18,22 @@ export type CrossfadePluginConfig = {
   fadeOutDuration: number;
   secondsBeforeEnd: number;
   fadeScaling: 'linear' | 'logarithmic' | number;
+  silenceAwareTransitions: boolean;
 };
 
 export type CrossfadeAudioFormat = 'webm' | 'mp4' | 'ogg' | 'mp3';
 
+type CrossfadeAudioAnalysis = {
+  audibleStart: number;
+  audibleEnd: number;
+  duration: number;
+};
+
 type CrossfadeBufferedAudio = {
   dataUrl: string;
   format: CrossfadeAudioFormat;
+  analysis?: CrossfadeAudioAnalysis;
+  analysisAttempted?: boolean;
 };
 
 type CrossfadePlayer = Element &
@@ -71,12 +80,22 @@ export default createPlugin<
      * @default 'linear'
      */
     fadeScaling: 'linear',
+    /**
+     * Detect audible track boundaries so fades are not spent on encoded
+     * leading or trailing silence.
+     *
+     * @default false
+     */
+    silenceAwareTransitions: false,
   },
-  menu({ window, getConfig, setConfig }) {
+  async menu({ window, getConfig, setConfig }) {
     const promptCrossfadeValues = async (
       win: BrowserWindow,
       options: CrossfadePluginConfig,
-    ): Promise<Omit<CrossfadePluginConfig, 'enabled'> | undefined> => {
+    ): Promise<
+      | Omit<CrossfadePluginConfig, 'enabled' | 'silenceAwareTransitions'>
+      | undefined
+    > => {
       const res = await prompt(
         {
           title: t('plugins.crossfade.prompt.options'),
@@ -160,7 +179,17 @@ export default createPlugin<
       };
     };
 
+    const config = await getConfig();
+
     return [
+      {
+        label: 'Silence-aware transitions',
+        type: 'checkbox',
+        checked: config.silenceAwareTransitions,
+        click(item: Electron.MenuItem) {
+          setConfig({ silenceAwareTransitions: item.checked });
+        },
+      },
       {
         label: t('plugins.crossfade.menu.advanced'),
         async click() {
@@ -205,6 +234,11 @@ export default createPlugin<
 
       const MIRROR_RETRY_DELAY_MS = 5000;
       const MIRROR_START_TIMEOUT_MS = 750;
+      const SILENCE_THRESHOLD_DB = -55;
+      const SILENCE_WINDOW_MS = 20;
+      const SILENCE_MIN_AUDIBLE_MS = 80;
+      const SILENCE_PREROLL_MS = 75;
+      const MAX_BUFFERED_TRACKS = 2;
 
       let transitionAudio: Howl | undefined;
       let transitionAudioVideoID: string | undefined;
@@ -216,9 +250,18 @@ export default createPlugin<
       let transitionTriggeredVideoID: string | undefined;
       let thresholdLoggedVideoID: string | undefined;
       let incomingFadePending = false;
+      let incomingFadeVideoID: string | undefined;
+      let incomingFadeAt: number | undefined;
       let incomingVolume = video.volume;
       let mirrorStartTimeout: number | undefined;
       let checkForCrossfade: (elapsed?: number) => void = () => undefined;
+
+      const bufferedAudioCache = new Map<string, CrossfadeBufferedAudio>();
+      const bufferedAudioPromises = new Map<
+        string,
+        Promise<CrossfadeBufferedAudio | undefined>
+      >();
+      const audioAnalysisByVideoID = new Map<string, CrossfadeAudioAnalysis>();
 
       const inferFormatFromDataUrl = (
         dataUrl: string,
@@ -233,41 +276,206 @@ export default createPlugin<
         return undefined;
       };
 
+      const analyzeBufferedAudio = async (
+        bufferedAudio: CrossfadeBufferedAudio,
+        videoID: string,
+      ): Promise<CrossfadeAudioAnalysis | undefined> => {
+        if (bufferedAudio.analysisAttempted) {
+          return bufferedAudio.analysis;
+        }
+        bufferedAudio.analysisAttempted = true;
+
+        try {
+          const encoded = await fetch(bufferedAudio.dataUrl).then((response) =>
+            response.arrayBuffer(),
+          );
+          const decoder = new OfflineAudioContext(1, 1, 44100);
+          const decoded = await decoder.decodeAudioData(encoded);
+          const windowFrames = Math.max(
+            1,
+            Math.round((decoded.sampleRate * SILENCE_WINDOW_MS) / 1000),
+          );
+          const requiredWindows = Math.max(
+            1,
+            Math.ceil(SILENCE_MIN_AUDIBLE_MS / SILENCE_WINDOW_MS),
+          );
+          const audiblePowerThreshold = 10 ** (SILENCE_THRESHOLD_DB / 10);
+
+          const isWindowAudible = (start: number, end: number) => {
+            let power = 0;
+            let samples = 0;
+
+            for (let channel = 0; channel < decoded.numberOfChannels; channel++) {
+              const channelData = decoded.getChannelData(channel);
+              for (let frame = start; frame < end; frame++) {
+                const sample = channelData[frame];
+                power += sample * sample;
+                samples += 1;
+              }
+            }
+
+            return samples > 0 && power / samples >= audiblePowerThreshold;
+          };
+
+          let audibleStartFrame: number | undefined;
+          let consecutiveAudibleWindows = 0;
+
+          for (
+            let start = 0;
+            start < decoded.length;
+            start += windowFrames
+          ) {
+            const end = Math.min(decoded.length, start + windowFrames);
+            if (isWindowAudible(start, end)) {
+              consecutiveAudibleWindows += 1;
+              if (consecutiveAudibleWindows >= requiredWindows) {
+                audibleStartFrame = Math.max(
+                  0,
+                  start - (requiredWindows - 1) * windowFrames,
+                );
+                break;
+              }
+            } else {
+              consecutiveAudibleWindows = 0;
+            }
+          }
+
+          let audibleEndFrame: number | undefined;
+          let latestAudibleWindowEnd: number | undefined;
+          consecutiveAudibleWindows = 0;
+
+          for (let end = decoded.length; end > 0; end -= windowFrames) {
+            const start = Math.max(0, end - windowFrames);
+            if (isWindowAudible(start, end)) {
+              if (consecutiveAudibleWindows === 0) {
+                latestAudibleWindowEnd = end;
+              }
+              consecutiveAudibleWindows += 1;
+              if (consecutiveAudibleWindows >= requiredWindows) {
+                audibleEndFrame = latestAudibleWindowEnd;
+                break;
+              }
+            } else {
+              consecutiveAudibleWindows = 0;
+              latestAudibleWindowEnd = undefined;
+            }
+          }
+
+          if (
+            audibleStartFrame === undefined ||
+            audibleEndFrame === undefined ||
+            audibleStartFrame >= audibleEndFrame
+          ) {
+            return undefined;
+          }
+
+          const prerollSeconds = SILENCE_PREROLL_MS / 1000;
+          const analysis = {
+            audibleStart: Math.max(
+              0,
+              audibleStartFrame / decoded.sampleRate - prerollSeconds,
+            ),
+            audibleEnd: Math.min(
+              decoded.duration,
+              audibleEndFrame / decoded.sampleRate + prerollSeconds,
+            ),
+            duration: decoded.duration,
+          } satisfies CrossfadeAudioAnalysis;
+
+          bufferedAudio.analysis = analysis;
+          audioAnalysisByVideoID.set(videoID, analysis);
+          console.info('[crossfade] Audio boundaries detected', {
+            videoID,
+            ...analysis,
+          });
+          return analysis;
+        } catch (error) {
+          console.warn('[crossfade] Audio boundary analysis failed', {
+            videoID,
+            error,
+          });
+          return undefined;
+        }
+      };
+
+      const trimBufferedAudioCache = () => {
+        while (bufferedAudioCache.size > MAX_BUFFERED_TRACKS) {
+          const oldestVideoID = bufferedAudioCache.keys().next().value as
+            | string
+            | undefined;
+          if (!oldestVideoID) {
+            break;
+          }
+          bufferedAudioCache.delete(oldestVideoID);
+        }
+      };
+
       const getBufferedAudio = async (
         videoID: string,
       ): Promise<CrossfadeBufferedAudio | undefined> => {
-        try {
-          const response = await this.ipc?.invoke(
-            'crossfade-audio-data-v1',
-            videoID,
-          );
-
-          if (
-            typeof response !== 'string' ||
-            !response.startsWith('data:audio/')
-          ) {
-            console.error(
-              '[crossfade] Invalid buffered audio response',
-              videoID,
-              typeof response,
-            );
-            return undefined;
+        const cached = bufferedAudioCache.get(videoID);
+        if (cached) {
+          if (this.config?.silenceAwareTransitions) {
+            await analyzeBufferedAudio(cached, videoID);
           }
-
-          const format = inferFormatFromDataUrl(response);
-          if (!format) {
-            console.error(
-              '[crossfade] Buffered audio has unsupported MIME type',
-              videoID,
-            );
-            return undefined;
-          }
-
-          return { dataUrl: response, format };
-        } catch (error) {
-          console.error('[crossfade] Failed to get buffered audio', error);
-          return undefined;
+          return cached;
         }
+
+        const pending = bufferedAudioPromises.get(videoID);
+        if (pending) {
+          return pending;
+        }
+
+        const request = (async () => {
+          try {
+            const response = await this.ipc?.invoke(
+              'crossfade-audio-data-v1',
+              videoID,
+            );
+
+            if (
+              typeof response !== 'string' ||
+              !response.startsWith('data:audio/')
+            ) {
+              console.error(
+                '[crossfade] Invalid buffered audio response',
+                videoID,
+                typeof response,
+              );
+              return undefined;
+            }
+
+            const format = inferFormatFromDataUrl(response);
+            if (!format) {
+              console.error(
+                '[crossfade] Buffered audio has unsupported MIME type',
+                videoID,
+              );
+              return undefined;
+            }
+
+            const bufferedAudio: CrossfadeBufferedAudio = {
+              dataUrl: response,
+              format,
+            };
+            bufferedAudioCache.set(videoID, bufferedAudio);
+            trimBufferedAudioCache();
+
+            if (this.config?.silenceAwareTransitions) {
+              await analyzeBufferedAudio(bufferedAudio, videoID);
+            }
+
+            return bufferedAudio;
+          } catch (error) {
+            console.error('[crossfade] Failed to get buffered audio', error);
+            return undefined;
+          } finally {
+            bufferedAudioPromises.delete(videoID);
+          }
+        })();
+
+        bufferedAudioPromises.set(videoID, request);
+        return request;
       };
 
       const getProgressValue = () =>
@@ -308,6 +516,20 @@ export default createPlugin<
         }
       };
 
+      const getNextPlaylistVideoID = () => {
+        try {
+          const playlist = api.getPlaylist<string[]>();
+          const index = api.getPlaylistIndex();
+          const videoID = playlist?.[index + 1];
+
+          return typeof videoID === 'string' && videoID.length > 0
+            ? videoID
+            : undefined;
+        } catch {
+          return undefined;
+        }
+      };
+
       const getActiveVideoID = () =>
         getVideoIDFromURL() ??
         getPlaylistVideoID() ??
@@ -319,6 +541,15 @@ export default createPlugin<
       const isMirrorReady = (videoID = currentVideoID) =>
         transitionAudioVideoID === videoID &&
         transitionAudio?.state() === 'loaded';
+
+      const mapAnalysisTimeToPlayer = (
+        analysisTime: number,
+        analysis: CrossfadeAudioAnalysis,
+        playerDuration: number,
+      ) =>
+        analysis.duration > 0 && Number.isFinite(playerDuration)
+          ? analysisTime * (playerDuration / analysis.duration)
+          : analysisTime;
 
       const clearRetry = () => {
         if (retryTimeout !== undefined) {
@@ -332,6 +563,19 @@ export default createPlugin<
           window.clearTimeout(mirrorStartTimeout);
           mirrorStartTimeout = undefined;
         }
+      };
+
+      const prefetchNextTrack = async () => {
+        if (!this.config?.silenceAwareTransitions) {
+          return;
+        }
+
+        const nextVideoID = getNextPlaylistVideoID();
+        if (!nextVideoID || nextVideoID === currentVideoID) {
+          return;
+        }
+
+        await getBufferedAudio(nextVideoID);
       };
 
       const scheduleRetry = (videoID: string) => {
@@ -384,6 +628,10 @@ export default createPlugin<
           return;
         }
 
+        if (bufferedAudio.analysis) {
+          audioAnalysisByVideoID.set(videoID, bufferedAudio.analysis);
+        }
+
         const audio = new Howl({
           src: [bufferedAudio.dataUrl],
           format: [bufferedAudio.format],
@@ -403,9 +651,11 @@ export default createPlugin<
             transitionAudio?.unload();
             transitionAudio = audio;
             transitionAudioVideoID = videoID;
+            bufferedAudioCache.delete(videoID);
             clearRetry();
             console.info('[crossfade] Transition audio ready', videoID);
             checkForCrossfade();
+            void prefetchNextTrack();
           },
           onloaderror: (_id, error) => {
             if (
@@ -448,6 +698,87 @@ export default createPlugin<
           fadeScaling: this.config?.fadeScaling,
           fadeDuration: duration,
         }).fadeTo(targetVolume);
+      };
+
+      const clearIncomingFadeBoundary = () => {
+        incomingFadeVideoID = undefined;
+        incomingFadeAt = undefined;
+      };
+
+      const startIncomingFade = (
+        activeVideoID: string,
+        elapsed = getProgressValue(),
+      ) => {
+        if (!incomingFadePending) {
+          return;
+        }
+
+        incomingFadePending = false;
+        clearIncomingFadeBoundary();
+
+        if (!this.config?.silenceAwareTransitions) {
+          fadeVideoIn(incomingVolume);
+          return;
+        }
+
+        const analysis =
+          audioAnalysisByVideoID.get(activeVideoID) ??
+          bufferedAudioCache.get(activeVideoID)?.analysis;
+        const playerDuration = getDuration();
+
+        if (!analysis || !Number.isFinite(playerDuration) || playerDuration <= 0) {
+          fadeVideoIn(incomingVolume);
+          return;
+        }
+
+        const audibleStart = mapAnalysisTimeToPlayer(
+          analysis.audibleStart,
+          analysis,
+          playerDuration,
+        );
+
+        if (!Number.isFinite(audibleStart) || elapsed >= audibleStart) {
+          fadeVideoIn(incomingVolume);
+          return;
+        }
+
+        incomingFadeVideoID = activeVideoID;
+        incomingFadeAt = audibleStart;
+        video.volume = 0;
+        console.info('[crossfade] Waiting for incoming audible start', {
+          videoID: activeVideoID,
+          audibleStart,
+        });
+      };
+
+      const checkIncomingFade = (elapsed = getProgressValue()) => {
+        if (
+          !incomingFadeVideoID ||
+          incomingFadeVideoID !== currentVideoID ||
+          incomingFadeAt === undefined
+        ) {
+          return;
+        }
+
+        if (!this.config?.silenceAwareTransitions) {
+          clearIncomingFadeBoundary();
+          fadeVideoIn(incomingVolume);
+          return;
+        }
+
+        if (
+          Number.isFinite(elapsed) &&
+          elapsed >= incomingFadeAt &&
+          isPlaybackActive()
+        ) {
+          const videoID = incomingFadeVideoID;
+          clearIncomingFadeBoundary();
+          console.info('[crossfade] Incoming audible start reached', {
+            videoID,
+            currentTime: elapsed,
+          });
+          fadeVideoIn(incomingVolume);
+        }
       };
 
       const getVolumeScale = () => {
@@ -644,6 +975,11 @@ export default createPlugin<
         startingMirrorVideoID = undefined;
         transitionTriggeredVideoID = undefined;
         thresholdLoggedVideoID = undefined;
+        clearIncomingFadeBoundary();
+
+        if (previousVideoID) {
+          audioAnalysisByVideoID.delete(previousVideoID);
+        }
 
         if (
           transitionAudio &&
@@ -660,8 +996,7 @@ export default createPlugin<
         });
 
         if (incomingFadePending) {
-          incomingFadePending = false;
-          fadeVideoIn(incomingVolume);
+          startIncomingFade(activeVideoID);
         }
 
         void prepareMirror(activeVideoID);
@@ -669,9 +1004,21 @@ export default createPlugin<
 
       checkForCrossfade = (elapsed?: number) => {
         const progressValue = elapsed ?? getProgressValue();
+        checkIncomingFade(progressValue);
+
         const duration = getDuration();
+        const analysis =
+          this.config?.silenceAwareTransitions && currentVideoID
+            ? audioAnalysisByVideoID.get(currentVideoID)
+            : undefined;
+        const effectiveEnd = analysis
+          ? Math.min(
+              duration,
+              mapAnalysisTimeToPlayer(analysis.audibleEnd, analysis, duration),
+            )
+          : duration;
         const threshold =
-          duration - (this.config?.secondsBeforeEnd ?? 0);
+          effectiveEnd - (this.config?.secondsBeforeEnd ?? 0);
 
         if (
           !currentVideoID ||
@@ -709,6 +1056,8 @@ export default createPlugin<
             videoID: currentVideoID,
             currentTime: progressValue,
             duration,
+            effectiveEnd,
+            silenceAware: Boolean(analysis),
             mirrorReady: isMirrorReady(),
           });
         }
