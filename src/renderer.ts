@@ -116,11 +116,16 @@ async function onApiLoaded() {
     switchRepeat(document, repeat);
   });
   window.ipcRenderer.on('peard:update-volume', (_, volume: number) => {
-    document
-      .querySelector<HTMLElement & { updateVolume: (volume: number) => void }>(
-        'ytmusic-player-bar',
-      )
-      ?.updateVolume(volume);
+    const value = Math.min(100, Math.max(0, Math.round(volume)));
+    api?.setVolume(value);
+
+    // The player API changes the actual volume but doesn't sync the sliders.
+    for (const selector of ['#volume-slider', '#expand-volume-slider']) {
+      const slider = document.querySelector<HTMLInputElement>(selector);
+      if (slider) {
+        slider.value = String(value > 0 && value < 5 ? 5 : value);
+      }
+    }
   });
 
   const isFullscreen = () => {

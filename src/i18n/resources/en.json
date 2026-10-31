@@ -424,7 +424,8 @@
     "crossfade": {
       "description": "Crossfade between songs",
       "menu": {
-        "advanced": "Advanced"
+        "advanced": "Advanced",
+        "silence-aware": "Silence-aware transitions"
       },
       "name": "Crossfade [Beta]",
       "prompt": {

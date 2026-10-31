@@ -2,15 +2,11 @@ import { Innertube } from 'youtubei.js';
 
 import { getNetFetchAsFetch } from '@/plugins/utils/main';
 
+import type { CrossfadeAudioFormat, CrossfadePluginConfig } from './index';
 import type { BackendContext } from '@/types/contexts';
-import type {
-  CrossfadeAudioFormat,
-  CrossfadePluginConfig,
-} from './index';
 
-export const backend = async ({
-  ipc,
-}: BackendContext<CrossfadePluginConfig>) => {
+export const backend = ({ ipc }: BackendContext<CrossfadePluginConfig>) => {
+  const MAX_CROSSFADE_AUDIO_BYTES = 32 * 1024 * 1024;
   const netFetch = getNetFetchAsFetch();
   const ytPromise = Innertube.create({
     fetch: netFetch,
@@ -86,9 +82,26 @@ export const backend = async ({
           continue;
         }
 
+        const contentLength = Number(response.headers.get('content-length'));
+        if (
+          Number.isFinite(contentLength) &&
+          contentLength > MAX_CROSSFADE_AUDIO_BYTES
+        ) {
+          failures.push(
+            `${client}: media exceeds ${MAX_CROSSFADE_AUDIO_BYTES} byte limit`,
+          );
+          continue;
+        }
+
         const audioBuffer = await response.arrayBuffer();
         if (audioBuffer.byteLength === 0) {
           failures.push(`${client}: empty media response`);
+          continue;
+        }
+        if (audioBuffer.byteLength > MAX_CROSSFADE_AUDIO_BYTES) {
+          failures.push(
+            `${client}: media exceeds ${MAX_CROSSFADE_AUDIO_BYTES} byte limit`,
+          );
           continue;
         }
 

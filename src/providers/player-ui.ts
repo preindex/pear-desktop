@@ -84,6 +84,8 @@ export const updateLike = (
   root: ParentNode,
   status: LikeType | `${LikeType}`,
 ) => {
+  if (getLikeStatus(root) === status) return;
+
   const likeButtonRenderer = getLikeButtonRenderer(root);
   if (likeButtonRenderer) {
     likeButtonRenderer.updateLikeStatus?.(status as LikeType);
