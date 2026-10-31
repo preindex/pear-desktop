@@ -47,6 +47,7 @@ interface VolumeFaderOptions {
    * time in milliseconds to complete a fade (default: 1000 ms)
    */
   fadeDuration?: number;
+  onUpdate?: (volume: number) => void;
 }
 
 interface VolumeFade {
@@ -72,6 +73,8 @@ export class VolumeFader {
   private fadeDuration: number = 1000;
   private active: boolean = false;
   private fade: VolumeFade | undefined;
+  private timer: number | undefined;
+  private readonly onUpdate: ((volume: number) => void) | undefined;
 
   /**
    * VolumeFader Constructor
@@ -102,6 +105,7 @@ export class VolumeFader {
       // Set log function explicitly to false
       this.logger = null;
     }
+    this.onUpdate = options.onUpdate;
 
     // Linear volume fading?
     if (options.fadeScaling === 'linear') {
@@ -196,10 +200,19 @@ export class VolumeFader {
    */
   start() {
     // Set fader to be active
+    if (this.timer !== undefined) {
+      window.clearInterval(this.timer);
+      this.timer = undefined;
+    }
     this.active = true;
 
     // Start by running the update method
     this.updateVolume();
+    if (this.active) {
+      // Timers continue to make progress in hidden/minimized windows. The
+      // elapsed-time calculation below catches up if Chromium throttles them.
+      this.timer = window.setInterval(() => this.updateVolume(), 16);
+    }
 
     // Return instance for chaining
     return this;
@@ -214,6 +227,10 @@ export class VolumeFader {
   stop() {
     // Set fader to be inactive
     this.active = false;
+    if (this.timer !== undefined) {
+      window.clearInterval(this.timer);
+      this.timer = undefined;
+    }
 
     // Return instance for chaining
     return this;
@@ -309,23 +326,27 @@ export class VolumeFader {
           (this.fade.time.end - this.fade.time.start);
 
         // Compute current level on internal scale
-        const level =
-          (progress * (this.fade.volume.end - this.fade.volume.start)) + this.fade.volume.start;
+        const levelDelta =
+          progress * (this.fade.volume.end - this.fade.volume.start);
+        const level = levelDelta + this.fade.volume.start;
 
         // Map fade level to volume level and apply it to media element
         this.media.volume = this.scale.internalToVolume(level);
-
-        // Schedule next update
-        window.requestAnimationFrame(this.updateVolume.bind(this));
+        this.onUpdate?.(this.media.volume);
       } else {
         // Log end of fade
         this.logger?.('Fade to ' + String(this.fade.volume.end) + ' complete.');
 
         // Time is up, jump to target volume
         this.media.volume = this.scale.internalToVolume(this.fade.volume.end);
+        this.onUpdate?.(this.media.volume);
 
         // Set fader to be inactive
         this.active = false;
+        if (this.timer !== undefined) {
+          window.clearInterval(this.timer);
+          this.timer = undefined;
+        }
 
         // Done, call back (if callable)
         if (typeof this.fade.callback === 'function') this.fade.callback();
@@ -377,7 +398,8 @@ export class VolumeFader {
     input = Math.log10(input);
 
     // Scale minus something × 10 dB to 0…1 (clipping at 0)
-    return Math.max(1 + (input / dynamicRange), 0);
+    const scaledInput = input / dynamicRange;
+    return Math.max(1 + scaledInput, 0);
   }
 }
 
