@@ -998,7 +998,6 @@ export default createPlugin<
           video.muted ||
           api.isMuted() ||
           video.volume <= 0 ||
-          document.visibilityState === 'hidden' ||
           getRepeatMode() === 'ONE'
         ) {
           return;
@@ -1136,8 +1135,11 @@ export default createPlugin<
         }
       };
 
-      const handleActiveTrack = (activeVideoID = getActiveVideoID()) => {
-        if (!activeVideoID || activeVideoID === currentVideoID) {
+      const handleActiveTrack = (
+        activeVideoID = getActiveVideoID(),
+        force = false,
+      ) => {
+        if (!activeVideoID || (!force && activeVideoID === currentVideoID)) {
           return;
         }
 
@@ -1268,8 +1270,10 @@ export default createPlugin<
         // During `playing`, getVideoData() corresponds to the media that
         // actually started. URL/playlist state can lag briefly when going back.
         const activeVideoID = api.getVideoData().video_id || getActiveVideoID();
+        // A queue repeat can hand off to the same video ID. The pending fade
+        // marks this playing event as a new playback instance in that case.
+        handleActiveTrack(activeVideoID, incomingFadePending);
         handoffRequested = false;
-        handleActiveTrack(activeVideoID);
         if (incomingFadePending && activeVideoID) {
           // Queue repeats may reuse the same video ID, so the active ID alone
           // cannot prove that the handoff failed.
@@ -1301,6 +1305,7 @@ export default createPlugin<
       });
 
       video.addEventListener('seeking', () => {
+        if (handoffRequested) return;
         if (activeOutgoing) {
           stopActiveOutgoing();
         }
@@ -1310,12 +1315,22 @@ export default createPlugin<
       });
 
       video.addEventListener('volumechange', () => {
+        const isIncomingFadeVolumeChange =
+          lastIncomingFaderVolume !== undefined &&
+          Math.abs(video.volume - lastIncomingFaderVolume) <= 0.001;
+
         if (video.muted || api.isMuted()) {
           // Never let a mirror bypass an explicit mute action.
           stopActiveOutgoing();
           if (incomingFadePending || incomingFadeVideoID) {
             restoreIncomingVolume();
           }
+        } else if (handoffRequested) {
+          if (video.volume > 0) {
+            incomingVolume = video.volume;
+          }
+          suppressVolumeChangeUntil = performance.now() + 100;
+          video.volume = 0;
         } else if (
           incomingFader &&
           lastIncomingFaderVolume !== undefined &&
@@ -1335,7 +1350,11 @@ export default createPlugin<
         ) {
           incomingVolume = video.volume;
         }
-        if (activeOutgoing && performance.now() > suppressVolumeChangeUntil) {
+        if (
+          activeOutgoing &&
+          !isIncomingFadeVolumeChange &&
+          performance.now() > suppressVolumeChangeUntil
+        ) {
           // End the mirror overlap on a user volume adjustment; the player's
           // volume remains authoritative and the new value cannot be replaced
           // by a stale fade envelope.
